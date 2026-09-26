@@ -1,0 +1,40 @@
+# Exemplo de configuracao de projeto AAMAD.
+# Copie para aamad.config.yml e ajuste para seu projeto.
+# Veja .cursor/templates/aamad-config-template.yml para os comentarios completos do schema.
+
+version: 1
+
+runtime:
+  target: crewai
+
+language:
+  primary: python
+  secondary: []
+
+libraries:
+  approved: []
+  forbidden: []
+
+ui:
+  theme: system
+  visual_style: minimal
+  prefer_modals: false
+
+coding_standards:
+  style_guide: ""
+  type_checking: true
+  max_file_lines: 400
+
+security:
+  require_security_assessment: true
+  forbid_committed_secrets: true
+  dependency_audit: true
+
+documentation:
+  require_user_guide: true
+  sync_docs_after_code_changes: true
+
+testing:
+  require_unit_tests: true
+  require_integration_tests: true
+  map_to_acceptance_criteria: true
