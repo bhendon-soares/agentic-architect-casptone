@@ -7,9 +7,9 @@ Este checklist guia voce passo a passo na execucao do AAMAD da Phase 1 (Define),
 
 ## Install and IDE layout
 
-- [ ] Instale prerequisites (Python 3.9+, Node quando sua stack precisar; veja [README.md](README.md)).
-- [ ] Instale AAMAD: `pip install aamad` ou `uv pip install aamad`.
-- [ ] Inicialize os arquivos do framework para sua IDE (escolha uma):
+- [x] Instale prerequisites (Python 3.9+, Node quando sua stack precisar; veja [README.md](README.md)).
+- [x] Instale AAMAD: `pip install aamad` ou `uv pip install aamad`.
+- [x] Inicialize os arquivos do framework para sua IDE (escolha uma):
 
   | IDE | Command |
   | :-- | :------ |
@@ -17,23 +17,23 @@ Este checklist guia voce passo a passo na execucao do AAMAD da Phase 1 (Define),
   | **Claude Code** | `aamad init --ide claude-code --dest .` |
   | **VS Code + GitHub Copilot** | `aamad init --ide vscode --dest .` |
 
-- [ ] Confirme os outputs esperados para a **sua** IDE (templates continuam em `.cursor/templates/` para todas):
+- [x] Confirme os outputs esperados para a **sua** IDE (templates continuam em `.cursor/templates/` para todas):
 
   - [ ] **Cursor:** `.cursor/agents/`, `.cursor/rules/`, `.cursor/prompts/`, `.cursor/skills/`, `.cursor/templates/`, root `AGENTS.md`
   - [ ] **Claude Code:** `.claude/` (`agents/`, `rules/`, `commands/`, `skills/`, `settings.json`), `.cursor/templates/`, `AGENTS.md`
-  - [ ] **VS Code + Copilot:** `.github/instructions/`, `.github/agents/`, `.github/prompts/` (includes `run-evals.prompt.md`), `.vscode/settings.json`, `.cursor/templates/`, `AGENTS.md`
+  - [x] **VS Code + Copilot:** `.github/instructions/`, `.github/agents/`, `.github/prompts/` (includes `run-evals.prompt.md`), `.vscode/settings.json`, `.cursor/templates/`, `AGENTS.md`
 
 - [ ] Opcionalmente copie `aamad.config.example.yml` → `aamad.config.yml` e defina project preferences.
-- [ ] Leia rapidamente o `AGENTS.md` da raiz para saber onde as personas ficam na sua IDE.
-- [ ] Para **invoke personas** (`@product-mgr`, `@backend.eng`, …) e referenciar arquivos, siga [README.md → Using AAMAD in your IDE](README.md#using-aamad-in-your-ide) (Cursor, Claude Code e VS Code diferem).
+- [x] Leia rapidamente o `AGENTS.md` da raiz para saber onde as personas ficam na sua IDE.
+- [x] Para **invoke personas** (`@product-mgr`, `@backend.eng`, …) e referenciar arquivos, siga [README.md → Using AAMAD in your IDE](README.md#using-aamad-in-your-ide) (Cursor, Claude Code e VS Code diferem).
 
 ---
 
 ## Runtime target (Phase 2 generated MVP)
 
-- [ ] Defina `AAMAD_TARGET_RUNTIME` antes do Build-phase implementation work (registre o valor resolvido em `sad.md` Audit e outros artifacts conforme as rules exigirem):
+- [x] Defina `AAMAD_TARGET_RUNTIME` antes do Build-phase implementation work (registre o valor resolvido em `sad.md` Audit e outros artifacts conforme as rules exigirem):
 
-  - [ ] `crewai` (default if unset / unknown per adapter registry)
+  - [x] `crewai` (default if unset / unknown per adapter registry)
   - [ ] `claude-agent-sdk`
   - [ ] `cursor-sdk`
 
@@ -41,7 +41,7 @@ Este checklist guia voce passo a passo na execucao do AAMAD da Phase 1 (Define),
 
 ## Phase 1: Requirements Definition (`@product-mgr`)
 
-- [ ] Invoque `@product-mgr` usando o agent chat da sua IDE (veja **Install and IDE layout** e README → Using AAMAD in your IDE).
+- [x] Invoque `@product-mgr` usando o agent chat da sua IDE (veja **Install and IDE layout** e README → Using AAMAD in your IDE).
 - [ ] **Recommended for specialized projects:** rode `*elicit-requirements` (ou escreva `system-description.md` voce mesmo) antes de MRD/PRD.
 - [ ] **MRD decision:**
   - [ ] Produto commercial / market-facing → produza MRD

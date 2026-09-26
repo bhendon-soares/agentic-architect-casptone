@@ -1,0 +1,53 @@
+# AAMAD project configuration
+# Copie para a raiz do projeto como aamad.config.yml (ou use aamad.config.example.yml).
+# Personas carregam este arquivo quando presente e respeitam preferencias salvo conflito com PRD/SAD
+# (registre conflitos em Open Questions — nao sobrescreva PRD/SAD silenciosamente).
+
+version: 1
+
+runtime:
+  # Prefira o env AAMAD_TARGET_RUNTIME para selecionar adapter; isto documenta a intencao.
+  target: crewai  # crewai | claude-agent-sdk | cursor-sdk
+
+language:
+  primary: python  # ex.: python | typescript
+  secondary: [typescript]    # linguagens adicionais opcionais
+
+libraries:
+  approved:
+    - crewai
+    - fastapi
+    - pydantic
+    - sqlalchemy
+    - psycopg
+    - pytest
+    - httpx
+    - react
+    - typescript
+    - vite
+    - ruff
+  forbidden: []    # proibicoes rigidas para este projeto
+
+ui:
+  theme: dark    # light | dark | system
+  visual_style: minimal
+  prefer_modals: false
+
+coding_standards:
+  style_guide: ruff  # ex.: ruff / eslint / google
+  type_checking: true
+  max_file_lines: 400
+
+security:
+  require_security_assessment: true
+  forbid_committed_secrets: true
+  dependency_audit: true
+
+documentation:
+  require_user_guide: true
+  sync_docs_after_code_changes: true
+
+testing:
+  require_unit_tests: true
+  require_integration_tests: true
+  map_to_acceptance_criteria: true
