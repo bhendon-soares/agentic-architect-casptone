@@ -63,27 +63,27 @@ Permitir que um colaborador interno descreva um problema de TI em portugues bras
 | `message_text` | string | Chat UI | obrigatorio, nao vazio, dentro do limite configurado |
 | `clarification_count` | integer | backend state | `0` ou `1` no P0 |
 | `conversation_history` | lista redigida | PostgreSQL | historico curto, sem secrets persistidos |
-| `knowledge_sources` | arquivos markdown/FAQ/runbook | knowledge local | fonte aprovada, path conhecido, categoria clara quando aplicavel |
+| `knowledge_sources` | sete markdowns ficticios em `knowledge/` | knowledge local | aprovacao somente para demo, path conhecido, categoria interna cadastrada e trecho extraido nao vazio |
 | `ticket_adapter_mode` | `mock` ou `servicenow` | `.env` | `mock` para testes; `servicenow` para demo real |
-| `servicenow_config` | env vars | runtime | nunca persistir valores secretos |
+| `servicenow_config` | env vars OAuth | runtime | `SERVICENOW_AUTH_MODE=oauth`; nunca persistir valores secretos |
 
 ## 4. Processing Behavior
 
 1. Frontend cria sessao em `POST /api/chat/sessions` quando necessario.
 2. Frontend envia mensagem para `POST /api/chat/sessions/{session_id}/messages`.
-3. Backend valida input, cria `request_id` e `agent_run_id`, mascara secrets/PII conhecidos e persiste mensagem redigida.
-4. Backend invoca `AgentRuntimeService` com CrewAI em processo sequencial.
+3. Backend valida input e bloqueia deterministicamente pedidos de revelacao de segredos, credenciais ou dados pessoais de terceiros antes da crew, persistindo `final_action=blocked` e evento redigido sem chamar CrewAI ou ServiceNow. Pedido legitimo de redefinicao de senha nao e bloqueado por essa regra.
+4. Para pedidos permitidos, backend cria `request_id` e `agent_run_id`, mascara secrets/PII conhecidos, persiste mensagem redigida e invoca `AgentRuntimeService` com CrewAI em processo sequencial.
 5. `IntakeTriageAgent` produz `TriageResult`.
-6. Backend valida taxonomia, mapeamento, `impact`, `urgency`, `confidence` e `resulting_priority`.
+6. Backend valida output Pydantic, taxonomia, mapeamento, `impact`, `urgency`, `confidence` e `resulting_priority` por exclusao P1, senao P2, senao P3, senao P4. Sugestao inicial equivale a `initial_action` de FR-002, sem segundo campo de decisao alem de `candidate_action` e `final_action`.
 7. `KnowledgeAgent` busca fonte local quando uma resposta puder depender de conhecimento operacional.
-8. Backend avalia fonte suficiente: pelo menos um trecho de fonte aprovada com correspondencia clara da categoria interna e instrucao operacional aplicavel ao problema relatado.
+8. Backend considera evidencia elegivel se houver arquivo existente cadastrado como aprovado somente para demo, `internal_category` igual a triagem e `snippet` extraido nao vazio; `QAPolicyAgent` continua responsavel pelo veto de instrucao nao aplicavel ou insegura. Fonte ausente, nao aprovada, vazia ou de outra categoria nao permite `respond`.
 9. `ResponseAgent` produz `ResponseDraft` com `candidate_action`.
 10. `QAPolicyAgent` aprova ou veta a acao insegura para `blocked`.
-11. Backend valida schema, dados minimos, limite de uma pergunta e contrato de seguranca; entao grava `final_action`.
+11. Cada uma das quatro tasks centrais usa `output_pydantic` (`TriageResult`, `EvidenceSet`, `ResponseDraft`, `PolicyDecision`) e passa somente output validado por `Task.context`; falha interrompe o fluxo com erro redigido e sem POST. Backend valida dados minimos, limite de uma pergunta e contrato de seguranca; se a decisao provisoria for `open_ticket`, solicita e valida `TicketPayloadDraft` antes de gravar `final_action`.
 12. Se `final_action=respond`, backend retorna resposta em pt-BR com fonte quando usada.
 13. Se `final_action=ask_clarification`, backend retorna uma pergunta objetiva e incrementa `clarification_count`.
-14. Se `final_action=open_ticket`, backend verifica dados minimos: descricao do problema, entendimento de `impact` e entendimento de `urgency`.
-15. `TicketingEscalationAgent` monta payload redigido e chama ServiceNow real ou mock/local.
+14. Para `final_action=open_ticket`, backend usa os dados minimos ja validados: descricao do problema, entendimento de `impact` e entendimento de `urgency`.
+15. `TicketingEscalationAgent` prepara `TicketPayloadDraft` redigido antes da decisao persistida (com `output_pydantic` se for task CrewAI), sem acesso a ferramenta mutating; somente o backend chama o adapter ServiceNow real ou mock/local apos validar payload e persistir `final_action=open_ticket`.
 16. Backend persiste `TicketRecord`, eventos de agentes e logs redigidos.
 17. Console admin lista conversas, tickets, fontes usadas, decisoes finais, eventos e metricas basicas.
 
@@ -95,6 +95,7 @@ Permitir que um colaborador interno descreva um problema de TI em portugues bras
 | `EvidenceSet` | titulo/path/trecho da fonte aprovada | response, admin |
 | `ResponseDraft` | mensagem proposta, pergunta ou resumo de ticket | policy gate |
 | `PolicyDecision` | aprovacao/veto e motivos seguros | backend |
+| `TicketPayloadDraft` | campos redigidos para incidente proposto; sem chamada externa pelo agente | backend |
 | `final_action` | `respond`, `ask_clarification`, `open_ticket` ou `blocked` | DB, frontend, admin |
 | `TicketRecord` | ticket local e dados retornados pelo ServiceNow/mock | DB, admin, chat |
 | `ChatResponse` | resposta HTTP final `{ data, error, meta }` | frontend |
@@ -105,14 +106,14 @@ Permitir que um colaborador interno descreva um problema de TI em portugues bras
 - `internal_category` deve ser: `password_reset`, `network_wifi`, `app_access`, `printer_label`, `critical_incident`, `applications_issues` ou `unknown`.
 - `servicenow_category` deve ser: `inquiry`, `software`, `hardware`, `network` ou `database`.
 - `impact` e `urgency` devem ser `1`, `2` ou `3`.
-- `resulting_priority` deve ser derivada somente de categoria, impacto e urgencia.
+- `resulting_priority` usa precedencia exclusiva: P1 se `critical_incident` ou (`impact=1` e `urgency=1`); senao P2 se `impact=1` ou `urgency=1`; senao P3 se `impact=2` ou `urgency=2`; senao P4. `impact=1, urgency=2` resulta em P2 salvo `critical_incident`.
 - `priority` nao deve ser obrigatorio no payload outbound ServiceNow.
 - `confidence >= 0.70` permite seguir sem esclarecimento quando demais criterios forem satisfeitos.
 - `confidence < 0.70` exige `ask_clarification` se nenhuma pergunta anterior foi feita.
 - `confidence < 0.70` apos uma pergunta gera `open_ticket` quando o pedido for legitimo e dados minimos estiverem seguros.
 - Cada conversa pode ter no maximo uma acao `ask_clarification`.
-- Fonte suficiente exige pelo menos um trecho aprovado com correspondencia clara da categoria interna e instrucao operacional aplicavel.
-- Pedido para revelar secrets, credentials, tokens, passwords, keys ou dados pessoais de terceiros deve gerar `blocked`.
+- Fonte elegivel exige cadastro aprovado para demo, categoria interna coincidente e trecho extraido nao vazio; o policy gate valida aplicabilidade e seguranca antes de `respond`. `unknown` nao autoriza resolucao inventada.
+- Pedido para revelar secrets, credentials, tokens, passwords, keys ou dados pessoais de terceiros deve gerar `blocked` antes da crew, sem tratar redefinicao legitima de senha como revelacao.
 - Logs, eventos, tickets e respostas nao podem conter secrets intencionais.
 - QA/policy deve executar antes da resposta final ou chamada mutating externa.
 
@@ -150,11 +151,11 @@ Persistir retorno quando disponivel:
 
 ## 8. Error Handling and Exceptions
 
-- Falha de schema interrompe o fluxo e registra `agent_event` redigido.
+- Falha de schema interrompe o fluxo, nao encaminha output invalido pelo `Task.context`, nao faz POST e registra `agent_event` redigido.
 - Falha de knowledge local escolhe `ask_clarification` ou `open_ticket`; nunca `respond` inventado.
 - Falha ServiceNow preserva ticket local com erro reprocessavel e mostra estado no admin.
 - Falha de redacao impede persistencia de texto sensivel e retorna erro seguro.
-- Prompt injection ou pedido inseguro retorna `blocked` e nao aciona ServiceNow.
+- Pedido de revelacao proibida retorna `blocked` antes da crew; outros pedidos inseguros vetados pelo policy gate nao acionam ServiceNow.
 - Erros HTTP usam `{ data: null, error: { code, message, retryable, details }, meta }` com `details` redigidos.
 
 ## 9. Acceptance Criteria
@@ -165,10 +166,13 @@ Persistir retorno quando disponivel:
 - Baixa confianca persistente apos uma pergunta abre ticket quando dados minimos forem seguros.
 - Fonte insuficiente nao gera resposta operacional inventada.
 - Pedido inseguro envolvendo secrets ou dados pessoais de terceiros gera `blocked`.
+- Bloqueio de revelacao proibida nao invoca a crew; falha de schema nao passa contexto invalido nem aciona o adapter.
+- `impact=1, urgency=2` gera P2 salvo `critical_incident`; apenas o backend chama o adapter depois de persistir `final_action=open_ticket`.
 - Ticket criado usa apenas `short_description`, `description`, `impact`, `urgency` e `category` como payload outbound obrigatorio.
 - `resulting_priority` e exibida/persistida, mas nao exigida como campo outbound ServiceNow.
 - Console admin mostra conversa, ticket, fonte, decisao final e eventos dos agentes.
-- Testes unitarios cobrem regras principais; teste de integracao cobre `chat -> agents -> ticket` com adapter mock/local.
+- Testes unitarios cobrem fonte vazia/de categoria errada, prioridade P2, bloqueio pre-crew, schema invalido e ordenacao persistencia/POST; primeiro teste integrado `password_reset` usa PostgreSQL, `TICKET_ADAPTER_MODE=mock` e mostra titulo/caminho/trecho ou numero de incidente mock. Demais fluxos P0 usam os 12 casos em `project-context/1.define/support-cases.json`.
+- No dataset, `expected_source` indica a fonte recuperada para a decisao, nao necessariamente exibida ao usuario. `test_mode=deterministic` assume categoria correta, confianca acima do limiar de escalonamento e dados minimos presentes; apenas TC004 (`expected_action=ask_clarification`) pede esclarecimento. TC012 e bloqueado antes da crew, sem categoria ou fonte recuperada. O fixture nao altera a politica de confianca do runtime normal.
 
 ## Sources
 
@@ -177,19 +181,14 @@ Persistir retorno quando disponivel:
 - `project-context/1.define/sad.md`
 - `.github/agents/system-arch.agent.md`
 - Solicitacao do operador em 2026-09-26 com decisoes fechadas do MVP Slim
+- Plano aprovado pelo operador em 2026-10-05: sete fontes ficticias aprovadas somente para demo, `unknown` limitado a coleta/escalonamento e primeiro fluxo `password_reset`.
 
 ## Assumptions
 
 - O runtime resolvido e `crewai`.
 - A SFS permanece necessaria porque o fluxo integrado P0 reduz ambiguidade para frontend, backend, integration e QA.
-- A base de conhecimento local e o dataset de 8-12 casos serao definidos na fase Build antes do teste de integracao.
-- O modo exato de autenticacao ServiceNow sera definido na Build conforme PDI disponivel, mantendo secrets em env vars.
-
-## Open Questions
-
-- Quais arquivos markdown/FAQ/runbook serao fontes aprovadas iniciais?
-- Quais 8-12 casos representativos comporao o dataset final de integracao?
-- A instancia ServiceNow PDI disponivel usara Basic Auth ou OAuth no scaffold final?
+- Sete markdowns ficticios em `knowledge/` foram aprovados pelo operador somente para a demo; `password_reset` e a primeira fatia, e o dataset de 12 casos foi aprovado antes da validacao final do P0.
+- O operador definiu OAuth para a PDI ServiceNow; `SERVICENOW_CLIENT_ID` e `SERVICENOW_CLIENT_SECRET` serao configurados por env vars na Build, sem valores secretos versionados.
 
 ## Audit
 
@@ -199,3 +198,5 @@ Persistir retorno quando disponivel:
 - Runtime resolvido: `crewai`
 - Ferramentas/arquivos lidos: `AGENTS.md`; `.github/instructions/aamad-core.instructions.md`; `.github/instructions/adapter-crewai.instructions.md`; `aamad.config.yml`; `project-context/1.define/mrd.md`; `project-context/1.define/prd.md`; SAD anterior; SFS anterior.
 - Decisao sobre SFS: substituir por SFS menor em vez de excluir, porque o fluxo `chat -> agents -> ticket` e P0, ajuda implementacao/teste e remove duplicacoes ou itens antigos fora do MVP Slim.
+- Revisao em 2026-10-05: SFS sincronizada com o SAD para evidencias, precedencia de prioridade, bloqueio pre-crew, schemas CrewAI e POST exclusivo do backend; validacao executada com `.venv/bin/aamad validate --phase define`.
+- Decisao do operador em 2026-10-05: autenticacao ServiceNow via OAuth.

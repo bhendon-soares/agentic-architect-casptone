@@ -380,14 +380,14 @@ N/A para lancamento comercial. Este e um MVP interno/capstone, nao um produto mo
 - Credenciais e instancia ServiceNow PDI estao disponiveis por environment variables, e o payload outbound confirmado exige somente `short_description`, `description`, `impact`, `urgency` e `category`.
 - O MVP permanece single-tenant, somente em portugues brasileiro e com console admin aberto, sem RBAC ou niveis de acesso.
 - PostgreSQL local via Docker sera o banco do MVP.
-- Arquivos locais de conhecimento serao preparados depois, antes do teste de integracao.
+- Fontes locais aprovadas somente para a demo: `knowledge/password_reset.md`, `knowledge/app_access.md`, `knowledge/applications_issues.md`, `knowledge/network_wifi.md`, `knowledge/printer_label.md`, `knowledge/critical_incident.md` e `knowledge/unknown.md`; `unknown` serve apenas para esclarecimento/escalonamento, nao para resolucao operacional.
 - `handoff_required` foi adiado intencionalmente para P1 para manter pequenos os estados de decisao P0.
 - Normalizacao fina de tipos entre aplicacao e ServiceNow, como `impact`/`urgency` numericos ou string no payload, sera resolvida na fase de Build.
+- Os 12 casos representativos foram definidos em `project-context/1.define/support-cases.json` para uso no teste de integracao.
 
 ## Open Questions
 
-- Quais 8-12 casos representativos definirao o dataset do MVP? Definicao adiada para Build antes do teste de integracao.
-- Quais arquivos locais markdown/FAQ/runbook serao fontes aprovadas de conhecimento? Definicao adiada para Build antes do teste de integracao.
+- Nenhuma em aberto para as fontes de conhecimento do MVP.
 
 ## Audit
 
