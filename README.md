@@ -1,5 +1,26 @@
 # AAMAD – AI-Assisted Multi-Agent Application Development Framework
 
+## Chat de suporte: demonstracao local
+
+A primeira etapa do frontend e um chat de suporte de TI em pt-BR com dados ficticios e servicos mockados. Nao ha backend, persistencia, console admin nem conexao ServiceNow nesta etapa.
+
+Requer Node.js >=20.19 ou >=22.12 e npm. Na raiz do projeto:
+
+```bash
+cd src/frontend
+npm ci
+npm run dev
+npm test
+npm run typecheck
+npm run build
+```
+
+Abra a URL exibida por `npm run dev` (por padrao `http://localhost:5173/`). Neste ambiente WSL, caso o `npm` do PATH aponte para o Windows, use `corepack npm` no lugar de `npm` para cada comando.
+
+O exemplo de redefinicao de senha ja aparece no campo de entrada. Clique em **Executar** para acompanhar a resposta e a fonte; **Reiniciar** limpa o historico local. A documentacao de contrato e criterios esta em `project-context/2.build/frontend-funcional-spec.md`, com decisoes em `project-context/2.build/frontend.md`.
+
+Ponto de integracao futura (`@integration.eng`): trocar `startRun` e `getRunStatus` em `src/frontend/mockRuns.ts` pela criacao de sessao `POST /api/chat/sessions`, envio `POST /api/chat/sessions/{session_id}/messages` e consulta `GET /api/agent-runs/{agent_run_id}` do SAD. Essas funcoes sao abstracoes do frontend, nao endpoints adicionais; acordar payloads com o backend antes da substituicao.
+
 **AAMAD** e um framework aberto, production-grade, para construir, implantar e evoluir aplicacoes multi-agent usando boas praticas de context engineering.  
 Ele sistematiza planejamento orientado por pesquisa, workflows modulares com agentes de IA e pipelines rapidos de MVP/devops para solucoes de IA prontas para contexto enterprise.
 
