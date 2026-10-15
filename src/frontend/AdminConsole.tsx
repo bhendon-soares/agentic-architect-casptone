@@ -1,12 +1,11 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import {
-    getAgentRun, getKnowledgeSources, getMetrics, getSession, getTickets,
-    type AgentRun, type ChatHistory, type KnowledgeSource, type Metrics, type RunError, type TicketPage,
+    getAdminConversation, getAdminConversations, getAgentRun, getKnowledgeSources, getMetrics, getTickets,
+    type AdminConversationDetail, type AdminConversationPage, type AgentRun, type KnowledgeSource, type Metrics, type RunError, type TicketPage,
 } from './chatApi'
 import './style.css'
 
 const pageSize = 20
-const sessionsKey = 'support-chat-sessions'
 
 const actionLabels: Record<string, string> = {
     respond: 'Resposta', ask_clarification: 'Esclarecimento', open_ticket: 'Ticket', blocked: 'Bloqueado',
@@ -24,24 +23,17 @@ function errorLabel(cause: unknown): string {
     return error?.message || 'Não foi possível carregar os dados. Tente novamente.'
 }
 
-function savedSessions(): string[] {
-    try {
-        const stored: unknown = JSON.parse(localStorage.getItem(sessionsKey) || '[]')
-        return Array.isArray(stored) ? stored.filter((id): id is string => typeof id === 'string') : []
-    } catch {
-        return []
-    }
-}
-
 export default function AdminConsole() {
     const [metrics, setMetrics] = useState<Metrics | null>(null)
+    const [conversations, setConversations] = useState<AdminConversationPage | null>(null)
+    const [conversationOffset, setConversationOffset] = useState(0)
     const [tickets, setTickets] = useState<TicketPage | null>(null)
     const [sources, setSources] = useState<KnowledgeSource[] | null>(null)
     const [offset, setOffset] = useState(0)
     const [loading, setLoading] = useState(true)
     const [error, setError] = useState<string | null>(null)
     const [sessionInput, setSessionInput] = useState('')
-    const [history, setHistory] = useState<ChatHistory | null>(null)
+    const [history, setHistory] = useState<AdminConversationDetail | null>(null)
     const [runs, setRuns] = useState<Record<string, AgentRun>>({})
     const [detailLoading, setDetailLoading] = useState(false)
     const [detailError, setDetailError] = useState<string | null>(null)
@@ -50,10 +42,11 @@ export default function AdminConsole() {
     async function refresh(nextOffset = offset) {
         setLoading(true)
         setError(null)
-        const results = await Promise.allSettled([getMetrics(), getTickets(pageSize, nextOffset), getKnowledgeSources()])
+        const results = await Promise.allSettled([getMetrics(), getTickets(pageSize, nextOffset), getKnowledgeSources(), getAdminConversations(pageSize, conversationOffset)])
         if (results[0].status === 'fulfilled') setMetrics(results[0].value)
         if (results[1].status === 'fulfilled') setTickets(results[1].value)
         if (results[2].status === 'fulfilled') setSources(results[2].value.items)
+        if (results[3].status === 'fulfilled') setConversations(results[3].value)
         if (results.some((result) => result.status === 'rejected')) {
             setError('Alguns dados não puderam ser carregados. Atualize para tentar novamente.')
         }
@@ -61,6 +54,20 @@ export default function AdminConsole() {
     }
 
     useEffect(() => { void refresh(0) }, [])
+
+    async function loadConversations(nextOffset: number) {
+        setLoading(true)
+        setError(null)
+        try {
+            const page = await getAdminConversations(pageSize, nextOffset)
+            setConversations(page)
+            setConversationOffset(nextOffset)
+        } catch (cause) {
+            setError(errorLabel(cause))
+        } finally {
+            setLoading(false)
+        }
+    }
 
     async function openSession(id: string) {
         if (!id.trim()) return
@@ -70,7 +77,7 @@ export default function AdminConsole() {
         setRuns({})
         setSelectedRun(null)
         try {
-            const data = await getSession(id.trim())
+            const data = await getAdminConversation(id.trim())
             setHistory(data)
             setSessionInput(data.session_id)
         } catch (cause) {
@@ -100,7 +107,6 @@ export default function AdminConsole() {
         }
     }
 
-    const knownSessions = savedSessions()
     const run = selectedRun ? runs[selectedRun] : null
 
     return (
@@ -129,6 +135,19 @@ export default function AdminConsole() {
 
                 <div className="admin-layout">
                     <div className="admin-column">
+                        <section className="admin-section admin-conversations" aria-labelledby="conversations-heading">
+                            <div className="admin-section-heading"><h2 id="conversations-heading">Conversas</h2><span>{conversations ? `${conversations.total} no total` : '—'}</span></div>
+                            {conversations?.items.length === 0 && <p className="admin-muted">Nenhuma conversa registrada.</p>}
+                            {conversations?.items.map((conversation) => <article className="admin-row" key={conversation.session_id}>
+                                <div><strong>Conversa {conversation.session_id.slice(0, 8)}</strong><span>{dateLabel(conversation.last_activity_at)} · {conversation.last_run ? (actionLabels[conversation.last_run.final_action || ''] || conversation.last_run.run_status) : conversation.status}{conversation.last_run?.error_code ? ` · ${conversation.last_run.error_code}` : ''}</span></div>
+                                <button type="button" className="admin-text-button" onClick={() => void openSession(conversation.session_id)}>Ver detalhes</button>
+                            </article>)}
+                            {conversations && conversations.total > pageSize && <div className="admin-pagination">
+                                <button type="button" disabled={loading || conversationOffset === 0} onClick={() => void loadConversations(Math.max(0, conversationOffset - pageSize))}>Anterior</button>
+                                <span>{conversationOffset + 1}–{Math.min(conversationOffset + pageSize, conversations.total)} de {conversations.total}</span>
+                                <button type="button" disabled={loading || conversationOffset + pageSize >= conversations.total} onClick={() => void loadConversations(conversationOffset + pageSize)}>Próxima</button>
+                            </div>}
+                        </section>
                         <section className="admin-section" aria-labelledby="tickets-heading">
                             <div className="admin-section-heading"><h2 id="tickets-heading">Tickets</h2><span>{tickets ? `${tickets.total} no total` : '—'}</span></div>
                             {tickets?.items.length === 0 && <p className="admin-muted">Nenhum ticket registrado.</p>}
@@ -161,24 +180,24 @@ export default function AdminConsole() {
                             <label htmlFor="session-id">ID da conversa</label>
                             <div><input id="session-id" value={sessionInput} onChange={(event) => setSessionInput(event.target.value)} placeholder="Cole o ID da conversa" /><button type="submit" disabled={!sessionInput.trim() || detailLoading}>Consultar</button></div>
                         </form>
-                        {knownSessions.length > 0 && <div className="admin-recent"><span>Recentes neste navegador</span><div>{knownSessions.map((id) => <button type="button" key={id} onClick={() => void openSession(id)} disabled={detailLoading}>{id.slice(0, 8)}…</button>)}</div></div>}
-                        {!history && !run && !detailLoading && !detailError && <p className="admin-muted">Selecione um ticket ou informe o ID de uma conversa para ver o histórico.</p>}
+                        {!history && !run && !detailLoading && !detailError && <p className="admin-muted">Selecione uma conversa ou um ticket para ver o histórico.</p>}
                         {detailLoading && <p role="status" className="admin-muted">Carregando detalhes…</p>}
                         {detailError && <p role="alert" className="admin-error">{detailError}</p>}
                         {history && <div className="admin-history">
                             <p className="admin-id">Conversa {history.session_id}</p>
+                            <p className="admin-muted">{history.status} · Criada em {dateLabel(history.created_at)} · Atualizada em {dateLabel(history.updated_at)}</p>
                             {history.messages.length === 0 && <p className="admin-muted">Ainda não há mensagens.</p>}
                             {history.messages.map((message) => <div className="admin-message" key={message.message_id}>
                                 <span>{message.role === 'user' ? 'Solicitante' : 'Suporte'} · {dateLabel(message.created_at)}</span>
                                 <p>{message.message_pt_br}</p>
                             </div>)}
                             <h3>Decisões e execuções</h3>
-                            {history.turns.length === 0 && <p className="admin-muted">Nenhuma decisão concluída.</p>}
-                            {history.turns.map((turn) => <div className="admin-turn" key={turn.agent_run_id}>
-                                <div><strong>{actionLabels[turn.final_action] || turn.final_action}</strong><span>{turn.summary}</span></div>
-                                <button type="button" className="admin-text-button" onClick={() => void openRun(turn.agent_run_id)}>Ver eventos</button>
-                                {turn.ticket && <p>Ticket: {turn.ticket.servicenow_number || turn.ticket.status}</p>}
-                                {turn.sources.map((source) => <p key={source.path}>Fonte: {source.title} · {source.path}</p>)}
+                            {history.runs.length === 0 && <p className="admin-muted">Nenhuma execução registrada.</p>}
+                            {history.runs.map((execution) => <div className="admin-turn" key={execution.agent_run_id}>
+                                <div><strong>{execution.final_action ? actionLabels[execution.final_action] : execution.status}</strong><span>{execution.summary || execution.error_code || execution.status} · {dateLabel(execution.started_at)}</span></div>
+                                <button type="button" className="admin-text-button" onClick={() => void openRun(execution.agent_run_id)}>Ver eventos</button>
+                                {history.tickets.filter((ticket) => ticket.agent_run_id === execution.agent_run_id).map((ticket) => <p key={ticket.ticket_id}>Ticket: {ticket.servicenow_number || ticket.ticket_id} · {ticketStatusLabels[ticket.status] || ticket.status}{ticket.error_code ? ` · ${ticket.error_code}` : ''}</p>)}
+                                {execution.sources.map((source) => <p key={source.path}>Fonte: {source.title} · {source.path}</p>)}
                             </div>)}
                         </div>}
                         {run && <div className="admin-events"><h3>Eventos da execução</h3><p className="admin-id">{run.agent_run_id} · {run.status}{run.error_code ? ` · ${run.error_code}` : ''}</p>

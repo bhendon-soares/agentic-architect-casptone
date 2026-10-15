@@ -16,6 +16,34 @@ export type ChatHistory = {
     turns: RunResult[]
 }
 
+export type AdminConversation = {
+    session_id: string
+    status: string
+    created_at: string
+    updated_at: string
+    last_activity_at: string
+    last_run: { final_action: FinalAction | null; run_status: string; error_code: string | null } | null
+}
+export type AdminConversationPage = { items: AdminConversation[]; total: number }
+export type AdminConversationDetail = {
+    session_id: string
+    status: string
+    created_at: string
+    updated_at: string
+    messages: { message_id: string; agent_run_id: string | null; role: 'user' | 'assistant'; message_pt_br: string; created_at: string }[]
+    runs: {
+        agent_run_id: string
+        status: string
+        started_at: string
+        finished_at: string | null
+        final_action: FinalAction | null
+        error_code: string | null
+        summary: string | null
+        sources: { title: string; path: string; snippet: string }[]
+    }[]
+    tickets: { ticket_id: string; agent_run_id: string; status: string; error_code: string | null; servicenow_number: string | null; created_at: string; updated_at: string }[]
+}
+
 export type Ticket = {
     ticket_id: string
     session_id: string
@@ -86,6 +114,14 @@ export async function createSession(): Promise<string> {
 
 export function getSession(sessionId: string): Promise<ChatHistory> {
     return request<ChatHistory>(`/api/chat/sessions/${encodeURIComponent(sessionId)}`)
+}
+
+export function getAdminConversations(limit = 20, offset = 0): Promise<AdminConversationPage> {
+    return request<AdminConversationPage>(`/api/admin/conversations?limit=${limit}&offset=${offset}`)
+}
+
+export function getAdminConversation(sessionId: string): Promise<AdminConversationDetail> {
+    return request<AdminConversationDetail>(`/api/admin/conversations/${encodeURIComponent(sessionId)}`)
 }
 
 export function sendMessage(sessionId: string, input: RunInput, key: string): Promise<RunResult> {

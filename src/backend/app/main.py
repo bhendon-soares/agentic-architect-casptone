@@ -3,13 +3,14 @@
 import os
 from datetime import datetime, timezone
 from hashlib import sha256
+from ipaddress import ip_address
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, select, union_all
 from sqlalchemy.orm import Session
 
 from app.adapters.tickets import TicketOutcomeUnknown, TicketRejected, create_incident
@@ -94,6 +95,26 @@ def identifier(value: str) -> str:
         return str(UUID(value))
     except ValueError as exc:
         raise HTTPException(422, "INVALID_ID") from exc
+
+
+def local_admin(request: Request) -> None:
+    host = request.client.host if request.client else ""
+    if host == "testclient":
+        return
+    try:
+        if ip_address(host).is_loopback:
+            return
+    except ValueError:
+        pass
+    raise HTTPException(403, "ADMIN_LOCAL_ONLY")
+
+
+def utc_iso(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
 
 
 class MessageInput(BaseModel):
@@ -499,6 +520,167 @@ def get_chat_session(
     )
 
 
+@app.get("/api/admin/conversations")
+def list_conversations(
+    request: Request,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_session),
+    _: None = Depends(local_admin),
+) -> dict:
+    activities = union_all(
+        select(ChatSession.session_id, ChatSession.updated_at.label("at")),
+        select(ChatMessage.session_id, ChatMessage.created_at.label("at")),
+        select(AgentRun.session_id, AgentRun.started_at.label("at")),
+        select(AgentRun.session_id, AgentRun.finished_at.label("at")).where(
+            AgentRun.finished_at.is_not(None)
+        ),
+        select(Ticket.session_id, Ticket.updated_at.label("at")),
+    ).subquery()
+    last_activity = (
+        select(activities.c.session_id, func.max(activities.c.at).label("at"))
+        .group_by(activities.c.session_id)
+        .subquery()
+    )
+    ranked_runs = (
+        select(
+            AgentRun.session_id,
+            AgentRun.status,
+            AgentRun.final_action,
+            AgentRun.error_code,
+            func.row_number()
+            .over(
+                partition_by=AgentRun.session_id,
+                order_by=(AgentRun.started_at.desc(), AgentRun.agent_run_id.desc()),
+            )
+            .label("position"),
+        )
+        .subquery()
+    )
+    total = db.scalar(select(func.count()).select_from(ChatSession)) or 0
+    rows = db.execute(
+        select(ChatSession, last_activity.c.at, ranked_runs)
+        .join(last_activity, last_activity.c.session_id == ChatSession.session_id)
+        .outerjoin(
+            ranked_runs,
+            (ranked_runs.c.session_id == ChatSession.session_id)
+            & (ranked_runs.c.position == 1),
+        )
+        .order_by(last_activity.c.at.desc(), ChatSession.session_id)
+        .limit(limit)
+        .offset(offset)
+    ).all()
+    return envelope(
+        {
+            "items": [
+                {
+                    "session_id": record.session_id,
+                    "status": record.status,
+                    "created_at": utc_iso(record.created_at),
+                    "updated_at": utc_iso(record.updated_at),
+                    "last_activity_at": utc_iso(activity),
+                    "last_run": {
+                        "final_action": final_action,
+                        "run_status": run_status,
+                        "error_code": error_code,
+                    }
+                    if run_status is not None
+                    else None,
+                }
+                for record, activity, _, run_status, final_action, error_code, _ in rows
+            ],
+            "total": total,
+        },
+        request,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@app.get("/api/admin/conversations/{session_id}")
+def get_admin_conversation(
+    session_id: str,
+    request: Request,
+    db: Session = Depends(get_session),
+    _: None = Depends(local_admin),
+) -> dict:
+    session_id = identifier(session_id)
+    record = db.get(ChatSession, session_id)
+    if record is None:
+        raise HTTPException(404, "SESSION_NOT_FOUND")
+    messages = db.scalars(
+        select(ChatMessage)
+        .where(ChatMessage.session_id == session_id)
+        .order_by(ChatMessage.created_at, ChatMessage.message_id)
+    ).all()
+    runs = db.scalars(
+        select(AgentRun)
+        .where(AgentRun.session_id == session_id)
+        .order_by(AgentRun.started_at, AgentRun.agent_run_id)
+    ).all()
+    tickets = db.scalars(
+        select(Ticket)
+        .where(Ticket.session_id == session_id)
+        .order_by(Ticket.created_at, Ticket.ticket_id)
+    ).all()
+    return envelope(
+        {
+            "session_id": session_id,
+            "status": record.status,
+            "created_at": utc_iso(record.created_at),
+            "updated_at": utc_iso(record.updated_at),
+            "clarification_count": record.clarification_count,
+            "messages": [
+                {
+                    "message_id": message.message_id,
+                    "agent_run_id": message.agent_run_id,
+                    "role": message.role,
+                    "message_pt_br": redact(message.message_pt_br),
+                    "created_at": utc_iso(message.created_at),
+                }
+                for message in messages
+            ],
+            "runs": [
+                {
+                    "agent_run_id": run.agent_run_id,
+                    "status": run.status,
+                    "started_at": utc_iso(run.started_at),
+                    "finished_at": utc_iso(run.finished_at),
+                    "final_action": run.final_action,
+                    "error_code": run.error_code,
+                    "summary": redact(run.response_data["summary"])
+                    if run.response_data and run.response_data.get("summary")
+                    else None,
+                    "sources": [
+                        {
+                            "title": redact(source["title"]),
+                            "path": redact(source["path"]),
+                            "snippet": redact(source["snippet"]),
+                        }
+                        for source in (run.response_data.get("sources") or [])
+                    ]
+                    if run.response_data
+                    else [],
+                }
+                for run in runs
+            ],
+            "tickets": [
+                {
+                    "ticket_id": ticket.ticket_id,
+                    "agent_run_id": ticket.agent_run_id,
+                    "status": ticket.status,
+                    "error_code": ticket.error_code,
+                    "servicenow_number": ticket.servicenow_number,
+                    "created_at": utc_iso(ticket.created_at),
+                    "updated_at": utc_iso(ticket.updated_at),
+                }
+                for ticket in tickets
+            ],
+        },
+        request,
+    )
+
+
 @app.get("/api/tickets")
 def list_tickets(
     request: Request,
@@ -586,8 +768,10 @@ def metrics(request: Request, db: Session = Depends(get_session)) -> dict:
             "responses_with_source": count(
                 select(func.count())
                 .select_from(AgentRun)
+                .where(AgentRun.status == "completed")
                 .where(AgentRun.final_action == "respond")
                 .where(AgentRun.response_data.is_not(None))
+                .where(func.json_array_length(AgentRun.response_data["sources"]) > 0)
             ),
             "blocked_requests": count(
                 select(func.count())

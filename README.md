@@ -19,7 +19,7 @@ Inicie o backend antes do frontend e abra a URL exibida por `npm run dev` (por p
 
 O exemplo de redefinicao de senha ja aparece no campo de entrada. Clique em **Executar** para acompanhar a resposta e a fonte; **Reiniciar** cria uma nova sessao, sem apagar a anterior. O seletor de conversas recupera o historico do servidor; os IDs das sessoes ficam neste navegador. A documentacao de integracao esta em `project-context/2.build/integration.md`.
 
-O console fica em `http://localhost:5173/admin` (ou no mesmo host/porta do frontend, com caminho `/admin`). Ele mostra metricas, tickets paginados, fontes e detalhes de conversas, decisoes e eventos dos agentes. O backend nao oferece listagem de todas as conversas: consulte uma pelo ID, selecione um ticket ou use as sessoes recentes deste navegador. O console nao tem autenticacao e destina-se somente a ambiente local/controlado.
+O console fica em `http://localhost:5173/admin` (ou no mesmo host/porta do frontend, com caminho `/admin`). Ele mostra metricas, conversas e tickets paginados, fontes e detalhes de conversas, decisoes e eventos dos agentes. Selecione uma conversa da lista, consulte pelo ID ou abra a conversa de um ticket. O console nao tem autenticacao e destina-se somente a ambiente local/controlado.
 
 O chat usa `POST /api/chat/sessions`, `POST /api/chat/sessions/{session_id}/messages` e `GET /api/chat/sessions/{session_id}`. O botao de retry reutiliza a chave de idempotencia do turno; resultado incerto de incidente requer consulta ao suporte e nao autoriza um novo POST remoto.
 

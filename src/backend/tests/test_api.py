@@ -4,21 +4,24 @@ import importlib.util
 import json
 import os
 from collections.abc import Iterator
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
+from starlette.requests import Request
 
 from app.adapters.tickets import TicketOutcomeUnknown, TicketRejected
-from app.main import app
+from app.main import app, local_admin
 from app.persistence.database import get_session
-from app.persistence.models import Base
+from app.persistence.models import AgentRun, Base, ChatMessage, ChatSession
 from app.runtime.crew import InvalidAgentOutput
 from app.runtime.policy import CATEGORIES, priority
 
@@ -67,6 +70,125 @@ def test_session_and_admin_reads(client: TestClient) -> None:
     assert len(sources) == 7
     assert all(source["approved"] for source in sources)
     assert client.get("/api/metrics/summary").json()["data"]["total_conversations"] == 1
+
+
+def test_admin_conversations_order_pagination_and_detail(client: TestClient) -> None:
+    db = next(app.dependency_overrides[get_session]())
+    start = datetime(2026, 10, 15, 12, tzinfo=timezone.utc)
+    ids = [f"{index:08d}-0000-4000-8000-000000000000" for index in range(1, 5)]
+    for session_id in ids:
+        db.add(ChatSession(session_id=session_id, created_at=start, updated_at=start))
+    db.flush()
+    db.add(
+        ChatMessage(
+            session_id=ids[0], role="user", message_pt_br="senha=sentinel-123",
+            created_at=start + timedelta(minutes=3),
+        )
+    )
+    failed_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    completed_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    db.add(
+        AgentRun(
+            agent_run_id=completed_id, session_id=ids[0], status="completed",
+            final_action="blocked", started_at=start + timedelta(minutes=1),
+            response_data={"summary": "Pedido bloqueado.", "sources": []},
+        )
+    )
+    db.add(
+        AgentRun(
+            agent_run_id=failed_id, session_id=ids[0], status="failed",
+            started_at=start + timedelta(minutes=4), error_code="RUNTIME_UNAVAILABLE",
+        )
+    )
+    db.add(
+        AgentRun(
+            session_id=ids[1], status="completed", final_action="respond",
+            started_at=start + timedelta(minutes=2),
+            response_data={
+                "summary": "Resumo senha=sentinel-123",
+                "sources": [{
+                    "title": "Manual", "path": "knowledge/unknown.md",
+                    "snippet": "token=sentinel-123", "private": "do not return",
+                }],
+                "private": "do not return",
+            },
+        )
+    )
+    db.add(
+        ChatMessage(
+            session_id=ids[2], role="user", message_pt_br="Outra conversa",
+            created_at=start + timedelta(minutes=2),
+        )
+    )
+    db.commit()
+    db.close()
+
+    first = client.get("/api/admin/conversations?limit=2&offset=0").json()
+    assert first["error"] is None
+    assert first["meta"]["limit"] == 2
+    assert first["data"]["total"] == 4
+    assert [item["session_id"] for item in first["data"]["items"]] == ids[:2]
+    assert first["data"]["items"][0]["last_run"] == {
+        "final_action": None,
+        "run_status": "failed",
+        "error_code": "RUNTIME_UNAVAILABLE",
+    }
+    assert first["data"]["items"][0]["last_activity_at"] == "2026-10-15T12:04:00+00:00"
+    assert [item["session_id"] for item in client.get(
+        "/api/admin/conversations?limit=2&offset=2"
+    ).json()["data"]["items"]] == ids[2:]
+    assert client.get("/api/admin/conversations?offset=10").json()["data"] == {
+        "items": [], "total": 4
+    }
+    detail = client.get(f"/api/admin/conversations/{ids[0]}").json()["data"]
+    assert [run["agent_run_id"] for run in detail["runs"]] == [completed_id, failed_id]
+    assert detail["runs"][1]["sources"] == []
+    assert detail["runs"][1]["summary"] is None
+    assert detail["tickets"] == []
+    assert client.get(f"/api/chat/sessions/{ids[0]}").json()["data"]["turns"] == [
+        {"summary": "Pedido bloqueado.", "sources": []}
+    ]
+    sourced = client.get(f"/api/admin/conversations/{ids[1]}").json()
+    assert "sentinel-123" not in json.dumps(sourced)
+    assert "private" not in json.dumps(sourced)
+
+
+def test_admin_local_and_invalid_requests(client: TestClient) -> None:
+    for path, code in (
+        ("/api/admin/conversations?limit=0", "INVALID_REQUEST"),
+        ("/api/admin/conversations?limit=101", "INVALID_REQUEST"),
+        ("/api/admin/conversations?offset=-1", "INVALID_REQUEST"),
+        ("/api/admin/conversations/not-uuid", "INVALID_ID"),
+        (
+            "/api/admin/conversations/00000000-0000-4000-8000-000000000000",
+            "SESSION_NOT_FOUND",
+        ),
+    ):
+        response = client.get(path)
+        assert response.json()["error"]["code"] == code
+        assert response.json()["meta"]["request_id"]
+    with pytest.raises(HTTPException) as blocked:
+        local_admin(Request({"type": "http", "client": ("198.51.100.12", 1234)}))
+    assert blocked.value.status_code == 403
+
+
+def test_source_metric_requires_completed_nonempty_sources(client: TestClient) -> None:
+    db = next(app.dependency_overrides[get_session]())
+    session = ChatSession()
+    db.add(session)
+    db.flush()
+    for status, sources in (
+        ("completed", []), ("completed", [{"path": "knowledge/unknown.md"}]),
+        ("failed", [{"path": "knowledge/unknown.md"}]),
+    ):
+        db.add(AgentRun(
+            session_id=session.session_id, status=status, final_action="respond",
+            response_data={"sources": sources},
+        ))
+    db.commit()
+    db.close()
+    summary = client.get("/api/metrics/summary").json()["data"]
+    assert summary["responses_with_source"] == 1
 
 
 def test_changed_knowledge_source_loses_approval(
@@ -361,6 +483,11 @@ def test_ticket_failure_never_reposts(
     assert len(calls) == 1
     assert client.get("/api/tickets").json()["data"]["items"][0]["status"] == expected
     assert client.get(f"/api/chat/sessions/{session_id}").json()["data"]["turns"] == []
+    detail = client.get(f"/api/admin/conversations/{session_id}").json()["data"]
+    assert detail["runs"][0]["agent_run_id"] == calls[0]
+    assert detail["runs"][0]["status"] == expected
+    assert detail["tickets"][0]["agent_run_id"] == calls[0]
+    assert detail["tickets"][0]["status"] == expected
 
 
 def test_ticket_success(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:

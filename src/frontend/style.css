@@ -802,12 +802,16 @@ h2 {
     display: contents;
   }
 
-  .admin-column .admin-section:first-child {
+  .admin-conversations {
     order: 1;
   }
 
-  .admin-column .admin-section:last-child {
+  .admin-column .admin-section:nth-child(2) {
     order: 3;
+  }
+
+  .admin-column .admin-section:last-child {
+    order: 4;
   }
 
   .admin-detail {
