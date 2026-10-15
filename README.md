@@ -2,7 +2,7 @@
 
 ## Chat de suporte: demonstracao local
 
-O frontend e um chat de suporte de TI em pt-BR com dados ficticios e servicos mockados; ainda nao esta conectado ao backend. O backend P0 tem API, persistencia PostgreSQL, catalogo local, fluxo CrewAI e adapter de incidentes mock ou ServiceNow OAuth. O console administrativo e exposto por endpoints HTTP, sem interface grafica integrada.
+O frontend inclui um chat de suporte de TI em pt-BR e um console administrativo para demo local, conectados ao backend. O backend P0 tem API, persistencia PostgreSQL, catalogo local, fluxo CrewAI e adapter de incidentes mock ou ServiceNow OAuth.
 
 Requer Node.js >=20.19 ou >=22.12 e npm. Na raiz do projeto:
 
@@ -15,11 +15,13 @@ npm run typecheck
 npm run build
 ```
 
-Abra a URL exibida por `npm run dev` (por padrao `http://localhost:5173/`). Neste ambiente WSL, caso o `npm` do PATH aponte para o Windows, use `corepack npm` no lugar de `npm` para cada comando.
+Inicie o backend antes do frontend e abra a URL exibida por `npm run dev` (por padrao `http://localhost:5173/`). O Vite encaminha `/api` para `http://127.0.0.1:8000` no desenvolvimento. Neste ambiente WSL, caso o `npm` do PATH aponte para o Windows, use `corepack npm` no lugar de `npm` para cada comando.
 
-O exemplo de redefinicao de senha ja aparece no campo de entrada. Clique em **Executar** para acompanhar a resposta e a fonte; **Reiniciar** limpa o historico local. A documentacao de contrato e criterios esta em `project-context/2.build/frontend-funcional-spec.md`, com decisoes em `project-context/2.build/frontend.md`.
+O exemplo de redefinicao de senha ja aparece no campo de entrada. Clique em **Executar** para acompanhar a resposta e a fonte; **Reiniciar** cria uma nova sessao, sem apagar a anterior. O seletor de conversas recupera o historico do servidor; os IDs das sessoes ficam neste navegador. A documentacao de integracao esta em `project-context/2.build/integration.md`.
 
-Ponto de integracao futura (`@integration.eng`): trocar `startRun` e `getRunStatus` em `src/frontend/mockRuns.ts` pela criacao de sessao `POST /api/chat/sessions` e envio sincrono `POST /api/chat/sessions/{session_id}/messages`; `GET /api/agent-runs/{agent_run_id}` serve a detalhes e reconciliacao, nao e polling obrigatorio. Essas funcoes sao abstracoes do frontend, nao endpoints adicionais; acordar payloads e retries com o backend antes da substituicao.
+O console fica em `http://localhost:5173/admin` (ou no mesmo host/porta do frontend, com caminho `/admin`). Ele mostra metricas, tickets paginados, fontes e detalhes de conversas, decisoes e eventos dos agentes. O backend nao oferece listagem de todas as conversas: consulte uma pelo ID, selecione um ticket ou use as sessoes recentes deste navegador. O console nao tem autenticacao e destina-se somente a ambiente local/controlado.
+
+O chat usa `POST /api/chat/sessions`, `POST /api/chat/sessions/{session_id}/messages` e `GET /api/chat/sessions/{session_id}`. O botao de retry reutiliza a chave de idempotencia do turno; resultado incerto de incidente requer consulta ao suporte e nao autoriza um novo POST remoto.
 
 ## Backend P0 local
 
