@@ -1,0 +1,202 @@
+# Especificacao funcional e tecnica do backend P0
+
+## Escopo e precedencia
+
+Especificacao para revisao. Autorizado iniciar por etapas o backend P0 (schemas, persistencia, migrations, agentes e adapters mock/ServiceNow) sem aguardar os ajustes de integracao com o frontend; contratos HTTP ainda sujeitos a revisao. Nao implementar o ramo pos-esclarecimento sem dados minimos ate decisao explicita de `@product-mgr` e `@integration.eng`. O MVP inclui criacao real de incidentes na ServiceNow PDI com OAuth quando `final_action=open_ticket`; `password_reset` e o primeiro fluxo integrado com PostgreSQL, conhecimento local e adapter `mock` para desenvolvimento/testes. O mock nao substitui a validacao real do MVP. Os contratos cobrem todas as categorias e rotas P0 do SAD. PRD, SAD e SFS prevalecem sobre escolhas propostas aqui. Runtime resolvido: `crewai` (`AAMAD_TARGET_RUNTIME=crewai`, coerente com `aamad.config.yml`). Sem `handoff_required`, autenticacao/RBAC, vector DB ou integracoes adicionais. Console admin aberto somente em ambiente local/demo controlado.
+
+## 1. Contrato HTTP proposto
+
+Todos os endpoints retornam JSON UTF-8 `{ "data": ..., "error": null, "meta": { "request_id": "uuid", "agent_run_id": null } }` no sucesso, ou `{ "data": null, "error": { "code": "...", "message": "...", "retryable": false, "details": null }, "meta": { "request_id": "uuid", "agent_run_id": null } }` em erro. `agent_run_id` so e preenchido se a execucao foi criada; IDs sao UUID string, datas UTC ISO-8601, `details` e redigido (ou `null`). `Content-Type: application/json` inclusive para erros. IDs desconhecidos retornam 404; parametros invalidos 422; nao expor exception/stack trace. `blocked` e resultado de negocio 200, nao erro HTTP. Nao expor raciocinio interno.
+
+| Rota SAD | Entrada (campos aceitos) | Sucesso `data` e status | Erros especificos |
+| :-- | :-- | :-- | :-- |
+| `POST /api/chat/sessions` | `{}` | 201 `{session_id, status:"active", clarification_count:0, created_at}` | 503 `DB_UNAVAILABLE` |
+| `POST /api/chat/sessions/{session_id}/messages` | `{message_text}` (1..2000 caracteres apos trim); `Idempotency-Key` opcional, unico por sessao | 200 `ChatTurn` abaixo, somente apos decisao e ticket confirmado quando aplicavel | 404 `SESSION_NOT_FOUND`; 422 `INVALID_MESSAGE`; 409 `TURN_IN_PROGRESS`/`IDEMPOTENCY_CONFLICT`; 503 `REDACTION_FAILED`/`DB_UNAVAILABLE`/`RUNTIME_UNAVAILABLE`; 502 `AGENT_OUTPUT_INVALID`/`TICKET_CREATE_FAILED`; 504 `RUNTIME_TIMEOUT`/`TICKET_OUTCOME_UNKNOWN`; proposta NAO aprovada: 422 `MINIMUM_TICKET_DATA_MISSING` apos pergunta unica |
+| `GET /api/chat/sessions/{session_id}` | path UUID | 200 `{session_id,status,clarification_count,messages:[ChatMessage],turns:[ChatTurn]}` em ordem cronologica | 404 `SESSION_NOT_FOUND` |
+| `GET /api/tickets` | `limit` 1..100 (default 20), `offset` >=0 (default 0) | 200 `{items:[TicketRecord],total}`; `meta` inclui `limit,offset` | 422 `INVALID_PAGINATION` |
+| `GET /api/tickets/{ticket_id}` | path UUID local | 200 `TicketRecord` (inclui `session_id`, `agent_run_id`, `source_refs`) | 404 `TICKET_NOT_FOUND` |
+| `GET /api/agent-runs/{agent_run_id}` | path UUID | 200 `{agent_run_id,session_id,status,started_at,finished_at,final_action,events:[AgentEvent],error_code}` | 404 `RUN_NOT_FOUND` |
+| `GET /api/metrics/summary` | nenhuma | 200 `{total_conversations,tickets_created,responses_with_source,blocked_requests}` (inteiros >=0) | 503 `DB_UNAVAILABLE` |
+| `GET /api/knowledge/sources` | nenhuma | 200 `{items:[{title,path,internal_category,approved}]}`; somente metadados da demo | 503 `KNOWLEDGE_UNAVAILABLE` |
+| `GET /health` | nenhuma | 200 `{status:"ok"}` | 503 `NOT_READY` (`data:null`, envelope de erro) |
+
+`ChatMessage`: `{message_id,role:"user"|"assistant",message_pt_br,created_at}` sempre redigido. `ChatTurn`: `{session_id,agent_run_id,final_action,message_pt_br,summary,sources:[{title,path,snippet}],triage:{internal_category,servicenow_category,impact,urgency,resulting_priority,confidence,risk_flags,initial_action}|null,ticket:{ticket_id,status,servicenow_sys_id,servicenow_number}|null}`. `sources` no chat contem apenas evidencia realmente usada para sustentar `respond`; outras fontes recuperadas ficam em eventos/admin. `triage=null` em bloqueio pre-crew. `TicketRecord`: `{ticket_id,session_id,agent_run_id,status:"pending"|"created"|"failed"|"outcome_unknown",adapter_mode,internal_category,servicenow_category,impact,urgency,resulting_priority,servicenow_sys_id,servicenow_number,redacted_payload,error_code,source_refs,created_at,updated_at}`. `AgentEvent`: `{event_id,task_id,producer,status,created_at,payload,validation_errors}` com payload e erros redigidos, sem prompts brutos. `agent_runs.status` e `running|completed|failed|outcome_unknown`; `final_action` em run/turn pertence ao backend. Um erro de ticket nao cria `ChatTurn` de sucesso: GET de sessao mantem mensagem de entrada redigida e turnos concluidos, e GET de run/ticket exibe a falha ou incerteza.
+
+Exemplos compactos para as leituras (cada objeto mostrado e o valor de `data` em `{ "data": ..., "error": null, "meta": { "request_id": "uuid", "agent_run_id": null } }`; nos detalhes de run, `meta.agent_run_id` e o ID consultado):
+
+| Requisicao | Exemplo `data` |
+| :-- | :-- |
+| `GET /api/chat/sessions/11111111-1111-4111-8111-111111111111` | `{ "session_id":"11111111-1111-4111-8111-111111111111", "status":"active", "clarification_count":0, "messages":[], "turns":[] }` |
+| `GET /api/tickets?limit=20&offset=0` | `{ "items":[], "total":0 }` (`meta.limit=20`, `meta.offset=0`) |
+| `GET /api/tickets/44444444-4444-4444-8444-444444444444` | `{ "ticket_id":"44444444-4444-4444-8444-444444444444", "session_id":"11111111-1111-4111-8111-111111111111", "agent_run_id":"33333333-3333-4333-8333-333333333333", "status":"created", "adapter_mode":"mock", "internal_category":"password_reset", "servicenow_category":"inquiry", "impact":3, "urgency":2, "resulting_priority":"P3", "servicenow_sys_id":"mock-001", "servicenow_number":"MOCK0001", "redacted_payload":{"short_description":"Falha na redefinicao de senha"}, "error_code":null, "source_refs":[], "created_at":"2026-10-13T12:00:00Z", "updated_at":"2026-10-13T12:00:01Z" }` |
+| `GET /api/agent-runs/33333333-3333-4333-8333-333333333333` | `{ "agent_run_id":"33333333-3333-4333-8333-333333333333", "session_id":"11111111-1111-4111-8111-111111111111", "status":"completed", "started_at":"2026-10-13T12:00:00Z", "finished_at":"2026-10-13T12:00:01Z", "final_action":"open_ticket", "events":[], "error_code":null }` |
+| `GET /api/metrics/summary` | `{ "total_conversations":1, "tickets_created":1, "responses_with_source":0, "blocked_requests":0 }` |
+| `GET /api/knowledge/sources` | `{ "items":[{"title":"Redefinicao de senha","path":"knowledge/password_reset.md","internal_category":"password_reset","approved":true}] }` |
+| `GET /health` | `{ "status":"ok" }` |
+
+Exemplos de contratos HTTP (UUIDs ilustrativos; strings em pt-BR sao dados de produto):
+
+```http
+POST /api/chat/sessions
+Content-Type: application/json
+
+{}
+
+HTTP/1.1 201 Created
+Content-Type: application/json
+
+{"data":{"session_id":"11111111-1111-4111-8111-111111111111","status":"active","clarification_count":0,"created_at":"2026-10-13T12:00:00Z"},"error":null,"meta":{"request_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","agent_run_id":null}}
+```
+
+```http
+POST /api/chat/sessions/11111111-1111-4111-8111-111111111111/messages
+Content-Type: application/json
+Idempotency-Key: demo-turn-001
+
+{"message_text":"Esqueci minha senha corporativa; consigo acessar o metodo oficial de verificacao."}
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"data":{"session_id":"11111111-1111-4111-8111-111111111111","agent_run_id":"22222222-2222-4222-8222-222222222222","final_action":"respond","message_pt_br":"Use o fluxo oficial de redefinicao e a verificacao de identidade configurada. Nao informe sua senha atual neste chat.","summary":"Orientacao de redefinicao de senha disponivel na fonte local.","sources":[{"title":"Redefinicao de senha","path":"knowledge/password_reset.md","snippet":"Oriente o uso do fluxo oficial de redefinicao de senha da organizacao e da verificacao de identidade configurada nesse fluxo."}],"triage":{"internal_category":"password_reset","servicenow_category":"inquiry","impact":3,"urgency":3,"resulting_priority":"P4","confidence":0.91,"risk_flags":[],"initial_action":"respond"},"ticket":null},"error":null,"meta":{"request_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","agent_run_id":"22222222-2222-4222-8222-222222222222"}}
+```
+
+Se metodo de verificacao estiver indisponivel, exemplo de ramo `open_ticket` do mesmo POST (nao uma rota adicional):
+
+```json
+{"data":{"session_id":"11111111-1111-4111-8111-111111111111","agent_run_id":"33333333-3333-4333-8333-333333333333","final_action":"open_ticket","message_pt_br":"Abri um incidente para validacao manual pelo suporte. Numero: MOCK0001.","summary":"Incidente de redefinicao de senha criado.","sources":[],"triage":{"internal_category":"password_reset","servicenow_category":"inquiry","impact":3,"urgency":2,"resulting_priority":"P3","confidence":0.88,"risk_flags":[],"initial_action":"open_ticket"},"ticket":{"ticket_id":"44444444-4444-4444-8444-444444444444","status":"created","servicenow_sys_id":"mock-001","servicenow_number":"MOCK0001"}},"error":null,"meta":{"request_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","agent_run_id":"33333333-3333-4333-8333-333333333333"}}
+```
+
+Exemplos de erro e de bloqueio (mesma estrutura nos demais endpoints):
+
+```http
+HTTP/1.1 422 Unprocessable Entity
+Content-Type: application/json
+
+{"data":null,"error":{"code":"INVALID_MESSAGE","message":"Descreva o problema em ate 2000 caracteres.","retryable":false,"details":null},"meta":{"request_id":"dddddddd-dddd-4ddd-8ddd-dddddddddddd","agent_run_id":null}}
+```
+
+```http
+HTTP/1.1 502 Bad Gateway
+Content-Type: application/json
+
+{"data":null,"error":{"code":"TICKET_CREATE_FAILED","message":"A criacao do incidente falhou. O suporte pode verificar o registro local antes de uma nova tentativa.","retryable":false,"details":null},"meta":{"request_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","agent_run_id":"33333333-3333-4333-8333-333333333333"}}
+```
+
+Este 502 representa falha confirmada sem incidente criado, por exemplo rejeicao validada pela PDI. Timeout apos envio NAO usa esse codigo:
+
+```http
+HTTP/1.1 504 Gateway Timeout
+Content-Type: application/json
+
+{"data":null,"error":{"code":"TICKET_OUTCOME_UNKNOWN","message":"Nao foi possivel confirmar se o incidente foi criado. Consulte o atendimento antes de tentar novamente.","retryable":false,"details":null},"meta":{"request_id":"99999999-9999-4999-8999-999999999999","agent_run_id":"33333333-3333-4333-8333-333333333333"}}
+```
+
+```json
+{"data":{"session_id":"11111111-1111-4111-8111-111111111111","agent_run_id":"55555555-5555-4555-8555-555555555555","final_action":"blocked","message_pt_br":"Nao posso fornecer a senha de outra pessoa. Procure o suporte pelos canais oficiais.","summary":"Pedido bloqueado por seguranca.","sources":[],"triage":null,"ticket":null},"error":null,"meta":{"request_id":"ffffffff-ffff-4fff-8fff-ffffffffffff","agent_run_id":"55555555-5555-4555-8555-555555555555"}}
+```
+
+`ask_clarification` devolve pergunta unica em `message_pt_br`, resumo curto, `sources:[]`, `ticket:null`; incrementa `clarification_count` uma vez na mesma transacao da decisao. Para GETs, `data` segue a forma da tabela (por exemplo `GET /api/tickets` devolve `{ "items": [], "total": 0 }`, `meta` traz `limit` e `offset`). Erros globais de validacao FastAPI tambem sao convertidos ao envelope acima. Ausencia de registro e erro de schema nao se confundem com `blocked`.
+
+**Proposta pendente de aprovacao por `@product-mgr` e `@integration.eng`, NAO contrato implementavel:** apos a unica pergunta, se descricao/impacto/urgencia ainda nao puderem ser estabelecidos com seguranca, retornar HTTP 422 `MINIMUM_TICKET_DATA_MISSING` (`retryable:false`, `data:null`, `meta.agent_run_id` preenchido), com mensagem pt-BR orientando contato com suporte por canal oficial, sem alegar ticket criado. Persistir `clarification_count=1`, mensagem de entrada redigida, `agent_runs.status=failed`, `agent_runs.final_action=null`, `error_code=MINIMUM_TICKET_DATA_MISSING` e evento redigido; nenhum ticket, POST, segunda pergunta ou `ChatTurn` de sucesso. Nao usar `blocked` (reservado para pedido inseguro), `respond` (sem evidencia operacional) nem `open_ticket` (sem minimo). Ate aprovacao das duas personas, os campos/HTTP deste ramo sao apenas proposta e bloqueiam implementacao deste caso; nao inserir quinta acao final.
+
+Exemplo ilustrativo da proposta NAO aprovada, somente para revisao, nao para consumo do frontend:
+
+```http
+HTTP/1.1 422 Unprocessable Entity
+Content-Type: application/json
+
+{"data":null,"error":{"code":"MINIMUM_TICKET_DATA_MISSING","message":"Ainda faltam dados para abrir um incidente com seguranca. Procure o suporte pelo canal oficial e informe o problema, o impacto e a urgencia.","retryable":false,"details":null},"meta":{"request_id":"88888888-8888-4888-8888-888888888888","agent_run_id":"77777777-7777-4777-8777-777777777777"}}
+```
+
+### Ponte para o frontend mockado
+
+`src/frontend/mockRuns.ts` espera `RunResult {final_action,message_pt_br,summary,sources[]}`; a integracao extrai esses quatro campos de `data` de `ChatTurn`, sem inferir acao de status HTTP, `triage` ou `ticket`. `sources[]` possui exatamente `title,path,snippet`. `summary` e justificativa curta, nao chain-of-thought; `message_pt_br` e obrigatorio para as quatro acoes em respostas de sucesso. `ticket` e complemento para exibir numero/status sem alterar `RunResult`. Erros HTTP mapeiam `error.code/message/retryable` para `RunError`, sem construir `RunResult` nem afirmar ticket criado; `blocked` permanece resultado bem-sucedido. A UI atual oferece Tentar novamente em toda falha: `@integration.eng` precisa desabilitar retry de POST em `TICKET_CREATE_FAILED`/`TICKET_OUTCOME_UNKNOWN` e mostrar caminho de consulta; a mensagem de erro deve continuar visivel. Na proposta sincrona, `idle -> running` comecaria antes do POST e `done` apos a resposta; `startRun/getRunStatus` sao abstracoes locais do mock, NAO novos endpoints nem polling obrigatorio. O `GET /api/agent-runs/{id}` do SAD serve para detalhe/admin e reconciliacao apos timeout, nao substitui contrato de polling sem decisao de integracao. `Reiniciar` na UI atual so limpa a memoria local; integracao decide quando criar nova sessao. Timeout, retry e compatibilidade do `RunResult` sao gates de revisao em Open Questions.
+
+## 2. Schemas, estado e persistencia
+
+- Entrada HTTP: `message_text` original so em memoria ate redacao; nunca guardar bruto em DB, stdout, excecao, trace ou ServiceNow. `session_id`, UUIDs e paginacao validados na borda; respostas serializaveis e redigidas.
+- `TriageResult`: `internal_category` enum PRD, `servicenow_category` enum PRD, `impact`/`urgency` inteiros 1..3, `resulting_priority` enum `P1|P2|P3|P4`, `confidence` 0..1, `risk_flags[]`, `missing_required_fields[]`, `initial_action` derivada da sugestao de intake. Categoria ServiceNow e prioridade recalculadas e comparadas pelo backend. Mapeamento: `password_reset/unknown -> inquiry`, `network_wifi -> network`, `app_access/critical_incident/applications_issues -> software`, `printer_label -> hardware`.
+- Prioridade em precedencia exclusiva: P1 se `critical_incident` ou impacto=1 e urgencia=1; senao P2 se impacto=1 ou urgencia=1; senao P3 se impacto=2 ou urgencia=2; senao P4. Nenhum atributo pessoal participa.
+- `EvidenceSet`: `sources[]` com `title,path,snippet,internal_category,approved,supports_operational_instruction`; referencia somente catalogo local. `ResponseDraft`: `message_pt_br,candidate_action,clarification_question,ticket_summary,source_refs,safety_notes`. `PolicyDecision`: `approved,veto_to_blocked,policy_reasons,redaction_status,safe_for_user,safe_for_ticket`. `TicketPayloadDraft`: `short_description,description,impact,urgency,category`. Outputs versionados `contract_version`, `agent_run_id`, `session_id`, `producer`, `created_at`, `payload`, `validation_errors`; Pydantic rejeita campos/valores invalidos e nao encaminha output nao validado.
+- `chat_sessions(session_id PK,status,clarification_count CHECK 0..1,created_at,updated_at)`; `chat_messages(message_id PK,session_id FK,agent_run_id FK nullable,role,message_pt_br redigida,created_at)`; `agent_runs(agent_run_id PK,session_id FK,status,model_config_safe,started_at,finished_at,final_action nullable,error_code nullable,idempotency_key nullable,request_hash nullable)`; indice unico `(session_id,idempotency_key)` para chave nao nula.
+- `agent_events(event_id PK,agent_run_id FK,task_id,producer,status,payload_redacted,validation_errors_redacted,created_at)`; `knowledge_sources(source_id PK,path UNIQUE,title,internal_category,approved,content_hash,updated_at)`; `tickets(ticket_id PK,session_id FK,agent_run_id FK UNIQUE,status,adapter_mode,internal_category,servicenow_category,impact,urgency,resulting_priority,redacted_payload,servicenow_sys_id,servicenow_number,error_code,created_at,updated_at)`; indices por sessao, run, status e data. Fontes usadas referenciadas por `agent_events`/`source_refs` (ids) sem duplicar markdown integral. Logs estruturados redigidos em STDOUT em P0; `app_logs` opcional somente se houver exigencia de persistencia no console.
+- Uma transacao grava mensagem redigida e run antes da crew; transacoes por etapa gravam eventos seguros. Uma transacao atomica incrementa esclarecimento OU grava `final_action` e ticket `pending` (quando aplicavel). Commit de `final_action=open_ticket` e payload validado antecede POST externo; outra transacao atualiza `created`/`failed`/`outcome_unknown`, `agent_runs.status` e `error_code`, e grava mensagem de sucesso SOMENTE para ticket `created`. Falha confirmada: ticket `failed`, run `failed`, `final_action=open_ticket` ja persistida, ID externo nulo e evento de rejeicao redigido. Resultado incerto: ticket/run `outcome_unknown`, `final_action=open_ticket` persistida, IDs externos nulos ate reconciliacao e evento de timeout redigido; `null` nao prova que nao houve criacao. Lock por sessao impede turnos paralelos de ultrapassar uma pergunta. Falha de banco antes do POST nao aciona adapter.
+- `Idempotency-Key` opcional identifica o MESMO envio HTTP e liga `(session_id,key)` a hash da entrada redigida e a um `agent_run_id`/ticket local; a mesma chave e mesmo hash recuperam resposta/erro ja registrados sem repetir crew nem POST, chave reaproveitada com entrada diferente retorna 409. Durante processamento, 409 `TURN_IN_PROGRESS` e `meta.agent_run_id` identificam o run; sem chave, nao ha deduplicacao confiavel de reenvios da UI. A chave nao e enviada como garantia de idempotencia da Table API ServiceNow e NAO torna segura a repeticao de um POST cujo resultado seja incerto. Falha confirmada somente permite novo POST controlado pelo operador sobre o mesmo ticket/run apos evidencia de nao criacao e validacao de dados/causa; nunca por retry automatico do chat. `outcome_unknown` exige consulta/reconciliacao manual no ServiceNow antes de qualquer novo POST; se criado, vincular `sys_id`/`number` ao ticket existente e marcar `created`; se comprovadamente nao criado, operador pode autorizar tentativa controlada. Sem prova, nenhum retry. Sem endpoint P0 novo para reprocessar incidentes.
+
+## 3. Fluxo CrewAI, conhecimento e decisao
+
+1. Validar mensagem, criar `request_id`, identificar pedido de revelar secrets/credenciais/dados pessoais de terceiros ANTES da crew. Tal pedido vira `blocked`, com mensagem/evento redigidos e sem CrewAI/ServiceNow; redefinicao legitima da propria senha nao e bloqueada. Redigir secrets/PII conhecidos antes de persistir, logar ou enviar ao LLM. Se redacao falhar, erro seguro 503 sem texto bruto persistido.
+2. `IntakeTriageAgent` produz `TriageResult` e sugestao `initial_action`. Backend verifica enums, correspondencia de categoria, prioridade, confianca e campos minimos. `confidence < 0.70` exige uma pergunta se ainda nao feita; depois da pergunta, ticket apenas quando legitimo e dados minimos seguros. `unknown` nunca vira resposta operacional inventada.
+3. `KnowledgeAgent` usa somente arquivos canonicos sob `KNOWLEDGE_BASE_PATH` (`knowledge/`), sem caminho arbitrario fornecido pelo agente/cliente. Cadastro permite as sete categorias do PRD somente para demo. Busca simples deterministica por categoria da triagem, leitura de trechos markdown locais e selecao por instrucoes aplicaveis ao relato; rejeitar path traversal/symlink para fora da base, arquivo ausente, nao aprovado, categoria divergente e trecho vazio. `EvidenceSet` inclui caminho relativo, titulo e trecho redigido; o backend confere existencia/cadastro/hash e elegibilidade, enquanto policy verifica aplicabilidade e instrucao segura. `knowledge/unknown.md` serve coleta/escalonamento, nao resolucao. Sem evidencia suficiente, perguntar (se falta detalhe e ha pergunta disponivel) ou abrir ticket (se minimo seguro), nunca fabricar procedimento.
+4. `ResponseAgent` prepara `ResponseDraft` com `candidate_action` em `respond|ask_clarification|open_ticket|blocked`. `QAPolicyAgent` valida fonte, seguranca, redacao e pode vetar para `blocked`; nenhum deles grava `final_action`. Se ticket proposto, `TicketingEscalationAgent` prepara `TicketPayloadDraft` seguro sem ferramenta mutating; validar antes de gravar acao. Backend resolve conflito entre outputs, limite de pergunta, minimo de ticket (descricao, entendimento de impacto e urgencia) e veto; so entao persiste `final_action`. Sem minimo seguro e sem pergunta restante: nao criar incidente nem inventar dados; consultar a proposta NAO aprovada na secao 1 e aguardar `@product-mgr` e `@integration.eng`.
+5. YAML em `src/backend/config/agents.yaml` e `tasks.yaml`; `app/runtime/crew.py` como entrada. Quatro tasks centrais com `output_pydantic` correspondente, `Process.sequential`, `allow_delegation=false`, `memory=False`, `Task.context` apenas outputs ja validados, `Task.id` explicito, guardrails de schema/tamanho/seguranca. A quinta task e condicional e usa `output_pydantic=TicketPayloadDraft`. Implementacao deve garantir pausa/validacao efetiva ENTRE tasks (nao confiar em `context` bruto do kickoff); falha de schema interrompe sem POST e registra erro redigido. Allowlist: busca local apenas para Knowledge; nenhum agente usa adapter ServiceNow. `max_iter<=12`, `max_retry_limit>=2` com limite temporal e `max_rpm` configuravel; retries da crew nao podem repetir POST. Registrar IDs, status/duracao e controles LLM nao secretos (modelo, temperatura, max tokens, rate), nunca prompts brutos ou chain-of-thought. Revisao humana deste contrato antes de habilitar provider real.
+
+## 4. Adapter de incidentes e migrations
+
+Interface unica `create_incident(payload: TicketPayloadDraft, agent_run_id) -> {sys_id,number,status}`; `agent_run_id` correlaciona estado local, sem alegar deduplicacao remota. Backend, nunca agente, escolhe `TICKET_ADAPTER_MODE=mock|servicenow`; o modo local `mock` nao satisfaz o aceite real do MVP. Payload outbound exato P0: `{ "short_description":"Falha na redefinicao de senha", "description":"Metodo de verificacao indisponivel; solicitar validacao manual.", "impact":"3", "urgency":"2", "category":"inquiry" }`. Campos nao vazios e redigidos; `impact`/`urgency` 1..3 serializados como strings na borda Table API; sem `priority` nem `resulting_priority` no POST. Modo real: `.env` local na raiz contem configuracao da PDI (`SERVICENOW_BASE_URL`, `SERVICENOW_INCIDENT_TABLE_PATH`, `SERVICENOW_CLIENT_ID`, `SERVICENOW_CLIENT_SECRET`, `SERVICENOW_AUTH_MODE=oauth`, `SERVICENOW_USERNAME`, `SERVICENOW_PASSWORD`); `.env.example` lista apenas os nomes e placeholders. Selecionar grant OAuth suportado pela PDI e endpoint de token (para credenciais de usuario, avaliar password grant somente se habilitado/autorizado na instancia), obter token e enviar `Authorization: Bearer` no POST Table API com timeout; persistir `result.sys_id`/`result.number` retornados. Nao presumir que a presenca das variaveis valida OAuth ou conectividade; nao usar Basic Auth como fallback, nao incluir secrets/token em arquivos, URL, logs, erros ou Audit, e nao enviar credenciais a hosts diferentes da PDI configurada. Validar host/base URL configurados e nao seguir redirecionamentos para hosts arbitrarios. Modo mock: mesmo contrato de request/response, IDs/numero estaveis por `agent_run_id`, sem rede; permite simular rejeicao ou timeout em testes. Rejeicao explicita/erro anterior ao envio com comprovacao de ausencia de criacao = `failed`/502; timeout, conexao interrompida apos envio ou resposta ilegivel sem confirmacao = `outcome_unknown`/504. Credenciais ausentes/invalidas em modo real falham sem fallback silencioso para mock. Sem retry cego de POST real; estados locais e erro seguro visiveis no admin; `tickets_created` conta somente status `created`.
+
+Primeira revision Alembic explicita e independente da metadata atual cria as seis tabelas minimas acima, FKs, constraints/indices; downgrade de desenvolvimento, sem migracao de SQLite ou dados legados. Sync idempotente do catalogo de sete arquivos da demo ocorre na consulta `GET /api/knowledge/sources`, sem ingerir conteudo sensivel no banco; conteudo alterado revoga aprovacao. `DATABASE_URL` vem do ambiente; nunca incluir credenciais em revision, exemplos ou logs. Implementados seis modelos e revision inicial fixa; upgrade/downgrade da revision foi verificado em schema PostgreSQL isolado, e `alembic upgrade head` foi aplicado ao banco principal vazio. O GET sincronizou sete fontes com `KNOWLEDGE_BASE_PATH=../../knowledge` no host; o valor `/knowledge` do `.env` local e exclusivo de container.
+
+## 5. Criterios de aceite e plano de testes (rastreabilidade)
+
+| FR PRD | Aceite backend verificavel | Teste planejado |
+| :-- | :-- | :-- |
+| FR-001 | Criar sessao, enviar turnos, recuperar historico pt-BR redigido; quatro acoes no contrato | API/DB: 201, POST, GET ordenado; 404/422; concorrencia, replay de mesma chave e 409 com hash diferente |
+| FR-002 | Sete categorias, mapeamento ServiceNow, impactos/urgencias 1..3, prioridade exclusiva, limiar 0.70 | Unidade parametrizada: P1..P4, `impact=1,urgency=2 -> P2`, confianca abaixo/acima, uma pergunta |
+| FR-003 | Fonte aprovada/local/mesma categoria/trecho nao vazio e instrucao aplicavel; `unknown` nao responde | Unidade: `password_reset.md`, ausente/vazio/fora da base/nao aprovado/outra categoria; fonte insuficiente sem `respond` |
+| FR-004 | Resposta pt-BR com fonte realmente utilizada, pergunta unica, sem procedimento inventado | Contrato `RunResult` nos quatro ramos; teste multi-turno de uma pergunta; caso sem minimo apos pergunta depende de aprovacao das duas personas |
+| FR-005 | Bloqueio pre-crew e redacao antes de DB, logs, LLM e ticket; QA veta resposta insegura | Spy assegura zero chamada crew/POST para pedido de segredo de terceiro; sentinel secret ausente em saida/DB/logs |
+| FR-006 | Commit de decisao precede POST; payload de cinco campos; OAuth e criacao real na ServiceNow PDI obrigatorios para aceite do MVP, com `sys_id`/`number` persistidos quando retornados | Contract mock: rejeicao confirmada `failed`/502 vs timeout `outcome_unknown`/504; ambos `retryable:false`, sem `priority`, sem segundo POST ao repetir chave. Gate manual na PDI: validar grant/token com configuracao local, POST real com dados sinteticos/redigidos, incidente confirmado na PDI e IDs/status conferidos no banco/admin; configuracao presente nao equivale a aceite |
+| FR-007 | Listas/detalhes exibem tickets, conversas, fontes, decisao, eventos e quatro metricas | Testes de cada GET, paginacao, ordenacao, 404 e agregacoes |
+| FR-008 | Eventos seguros e falha de schema interrompem contexto/POST; dataset cobre 8-12 casos | Integracao PostgreSQL `password_reset` respond (TC001) e ticket mock (TC002); depois TC003-TC012; log scan |
+
+`project-context/1.define/support-cases.json` e fixture de 12 casos: TC004 pergunta, TC012 bloqueio antes da crew; `expected_source` indica recuperacao, nao exibicao. Modo deterministico injeta resultados de crew validados, categoria correta, confianca e dados minimos conforme SFS; nao altera politica em runtime real. Ramo apos pergunta sem dados minimos: NAO implementar contrato proposto antes das duas aprovacoes; apos decisao, testar `clarification_count=1`, nenhum segundo esclarecimento, `TicketPayloadDraft`/POST/ticket ausentes e estado/envelope aprovados. Testar falha confirmada e resultado incerto com `final_action=open_ticket` persistida antes de POST, estado local e run coerentes, erro pt-BR sem `RunResult`, `retryable:false`, reenvio da mesma chave sem duplicacao, e reconciliacao antes de novo POST. A configuracao local da PDI esta disponivel via `.env`; na etapa de integracao real, validar grant/token primeiro e executar fluxo `password_reset -> open_ticket` em `TICKET_ADAPTER_MODE=servicenow` com dados sinteticos/redigidos, confirmar incidente remoto e IDs/status no banco/admin; nao usar apenas retorno do mock como evidencia. Em 2026-10-13, Docker Desktop respondeu, o servico `db` iniciou e ficou healthy, e uma consulta SQL ao PostgreSQL retornou `support|support|1`; confirmar disponibilidade novamente ao executar a integracao. A nota de scaffold em `setup.md` descreve uma verificacao antiga, nao o estado permanente. Verificar tambem envelope, migration Alembic e configuracao `Process.sequential`/YAML/guardrails. Nao reivindicar aceites completos ate execucao dos testes.
+
+### Checklist para implementacao por etapas e aceite
+
+- [x] Operador autorizou atualizar esta spec para iniciar o backend por etapas; integracao com frontend e validacao real na PDI ficam para etapas posteriores, sem dispensar o aceite real ServiceNow.
+- [x] Base de dados, seis modelos, rotas P0, adapter mock/ServiceNow OAuth e testes HTTP/mock implementados; migration verificada em schema PostgreSQL isolado, sem afetar tabelas existentes.
+- [x] Etapas CrewAI gravam eventos `validated` ou `failed` em transacoes independentes, com schema/status ou codigo generico, sem saida bruta ou texto de excecao; testes simulados cobrem ordem, persistencia e falha.
+- [x] Configurados limites nativos do agente (`max_rpm` por etapa e 60 segundos de execucao) e timeout de 30 segundos no LLM; inferencia real curta via CrewAI com transporte Foundry `/openai/v1/` respondeu. As quatro etapas e limites efetivos em producao seguem pendentes de validacao com provider real.
+- [x] Dataset TC001-TC012 coberto em contrato HTTP deterministico: TC012 bloqueado antes da crew, demais casos com decisao injetada e adapter sintetico, incluindo prioridade, fonte exposta somente em resposta, ticket e historico. Isso nao valida a classificacao do provider real nem a selecao de fontes pelo LLM.
+- [x] Borda HTTP aplica redacao novamente a mensagem, resumo, snippets de fontes e payload de ticket antes da persistencia/adapter, e rejeita saida incompleta com erro seguro.
+- [ ] Gate de implementacao: validar fluxo CrewAI com provider configurado, redacao robusta de segredos/PII, eventos por task e limites efetivos de timeout/rate. A suite local passou com 51 testes e 1 skip (migration PostgreSQL fora da execucao padrao); a migration reversivel passou separadamente em schema PostgreSQL isolado e `alembic upgrade head` passou no banco principal vazio. O dataset TC001-TC012 foi coberto com decisoes injetadas, nao inferencia real. Um teste com CrewAI simulado cobriu YAML, ordem das quatro etapas e fonte local, mas nao verifica provider real. O catalogo sincronizou sete fontes na consulta administrativa com `KNOWLEDGE_BASE_PATH=../../knowledge` no host; o valor `/knowledge` do `.env` de container nao existe fora dele. Nao tratar os testes com executor injetado como prova de runtime real.
+- [x] Gate externo de conectividade: grant OAuth validado; um incidente sintetico foi criado na PDI por turno HTTP com decisao injetada, ticket `created` persistido e `sys_id`/`number` conferidos via GET remoto. Isso nao valida a decisao autogerada da CrewAI nem aprova o MVP completo.
+
+- [ ] `@product-mgr` e `@integration.eng` aprovam explicitamente ou substituem a proposta `MINIMUM_TICKET_DATA_MISSING` (HTTP, `final_action=null`, persistencia e orientacao segura); sem ambas as aprovacoes, nao implementar esse ramo nem declarar a spec pronta.
+- [ ] `@integration.eng` aprova contrato sincrono/envelope, tratamento da FSM, timeout, visualizacao de `failed`/`outcome_unknown`, supressao de retry automatico e papel limitado da `Idempotency-Key`, sem novos endpoints.
+- [ ] `@qa.eng` aprova schemas, GETs/admin, fixture TC001-TC012, casos de dados minimos ausentes, falha confirmada/incerta e criterios FR-001..FR-008; PostgreSQL e incidente sintetico na PDI foram verificados, mas aprovacao QA do MVP e fluxo CrewAI real permanecem pendentes.
+- [ ] `@security.eng` revisa bloqueio pre-crew, redacao/PII, logs, guardrails e reconciliacao de POST incerto.
+- [x] Grant OAuth na PDI validado por probe somente de token; em execucao separada, um POST de incidente sintetico retornou confirmacao, persistida localmente e conferida por GET remoto. Token/credenciais nao foram impressos.
+- [ ] Revisao humana dos contratos HTTP e resolucao das Open Questions antes da integracao com frontend e do aceite; nao implementar o ramo sem dados minimos ate aprovacao de `@product-mgr` e `@integration.eng`.
+
+## Sources
+
+- `AGENTS.md`; `.github/agents/backend-eng.agent.md`; `.github/instructions/aamad-core.instructions.md`; `.github/instructions/adapter-registry.instructions.md`; `.github/instructions/adapter-crewai.instructions.md`; `aamad.config.yml`.
+- `project-context/1.define/prd.md` (FR-001..FR-008, Decision Rules e ServiceNow Contract); `project-context/1.define/sad.md` (Backend/API, data, orchestration e testing); `project-context/1.define/sfs/multi-agent-support-flow.md` (sequencia, validacoes, erros).
+- `project-context/2.build/setup.md`; `project-context/2.build/frontend-funcional-spec.md`; `src/frontend/mockRuns.ts`; `src/frontend/App.tsx`; `project-context/1.define/support-cases.json`; `knowledge/password_reset.md`; `.env.example` (nomes de configuracao); `.env` local (presenca de configuracao conferida pelo operador, valores sigilosos nao transcritos); `src/backend/app/runtime/crew.py` (etapas P0, provider real pendente de teste).
+
+## Assumptions
+
+- Requisicao de mensagem e sincrona no primeiro corte; exemplos de campos, codigos HTTP, paginacao, idempotency key e politica de status incerto sao propostas desta especificacao, nao decisoes ja fechadas no PRD/SAD.
+- Fonte demonstrativa so e aprovada para demo, nao para suporte real. Dados de exemplos sao sinteticos. `P1..P4` e representacao serializada proposta da prioridade, sujeita a acordo com integracao.
+- `GET /health` usa o envelope comum apesar de sua finalidade operacional; estado de dependencia obrigatoria requer definicao no review. O frontend mock atual so demonstra `respond` e nao implementa console admin nem persistencia.
+
+## Open Questions
+
+- `@integration.eng`: confirmar POST sincrono vs futuro processamento assicrono, janela de timeout HTTP, mapeamento da FSM `startRun/getRunStatus`, uso de `GET /api/agent-runs/{id}` apos falha, comportamento de retry com `Idempotency-Key`, criacao de nova sessao em Reiniciar e exibicao de numero/status do ticket fora dos quatro campos `RunResult`. Nenhum endpoint novo sera criado apenas para imitar o mock.
+- `@integration.eng`/`@product-mgr`: proposta HTTP 422 `MINIMUM_TICKET_DATA_MISSING` com `final_action=null` e run `failed` ainda nao aprovada por nenhuma das duas personas. Em consulta nesta revisao, foi confirmado "Aprovacao pendente"; obter aprovacao explicita de ambas (ou decisao alternativa coerente com as quatro acoes P0) antes de fixar contrato e implementar.
+- `@integration.eng`/`@qa.eng`: aprovar shape proposto dos GETs/admin, `summary`, representacao `P1..P4`, limite de mensagem, paginacao e padrao de `source_refs`; SFS nao fixa esses campos HTTP.
+- `@backend.eng`/`@security.eng`: confirmar detector deterministico de pedidos de revelacao vs reset legitimo, politica minima de PII, timeout/retencao de logs, mecanismos de guardrail entre tasks, observabilidade sem prompts brutos e como provar ausencia de criacao na PDI para reconciliar resultado incerto. O grant OAuth, um POST sintetico confirmado e GET remoto passaram; falta validar a orquestracao completa da CrewAI e obter revisao de seguranca antes do aceite MVP.
+
+## Audit
+
+- Data: 2026-10-13. Persona: `backend-eng`. Acao: especificar backend P0 antes de `*develop-be`/`*implement-endpoint`; nenhuma implementacao executada nesta etapa.
+- Runtime resolvido: `crewai` por variavel `AAMAD_TARGET_RUNTIME=crewai` e config. Ferramentas: leitura local de artefatos/regras/scaffold e `apply_patch` para esta especificacao. Runtime de agentes nao executado; modelo, temperatura, max_tokens e rate efetivos nao aplicaveis nesta etapa (placeholders `LLM_MODEL`, `LLM_TEMPERATURE=0`, `LLM_MAX_TOKENS=1024`, `LLM_MAX_RPM=10` no `.env.example`). Prompt Trace omitido: artefato de planejamento sujeito a revisao humana, sem prompts de producao nem dados de usuario reais.
+- Revisao 2026-10-13: pedido de aprovacao do caso sem dados minimos encaminhado via consulta ao operador; resposta "Aprovacao pendente". Nenhuma aprovacao atribuida a `@product-mgr` ou `@integration.eng`; a proposta de HTTP 422, `final_action=null` e run `failed` permanece nao normativa. Nao houve decisao aprovada para esse ramo.
+- Contratos revisados nesta etapa para revisao: falha confirmada `TICKET_CREATE_FAILED`/502 (`tickets.status=failed`, `agent_runs.status=failed`) versus resultado incerto `TICKET_OUTCOME_UNKNOWN`/504 (ambos `outcome_unknown`), `final_action=open_ticket` pre-POST em ambos, sem `ChatTurn` de sucesso, `retryable=false`, retry apenas por operador apos prova de nao criacao; `Idempotency-Key` deduplica HTTP local, nao POST ServiceNow. Exemplos, schemas e testes sincronizados. Estas escolhas aguardam revisao de integracao/seguranca; nao representam aprovacao dessas personas.
+- PostgreSQL: revalidado em 2026-10-13 com `docker version` (CLI e daemon Docker Desktop 29.4.2 acessiveis), `docker compose up -d db` e `docker compose up --wait db` (healthy). `docker compose ps db` confirmou PostgreSQL 16 na porta `127.0.0.1:5432`; `docker compose exec -T db psql -U support -d support -tAc 'SELECT current_database(), current_user, 1'` retornou `support|support|1`. Disponibilidade futura nao presumida; nenhuma implementacao backend/frontend nesta revisao.
+- Revisao de escopo em 2026-10-13: operador confirmou que o MVP exige integracao real com ServiceNow PDI. Mock permanece para desenvolvimento/testes; aceite FR-006 exige OAuth, incidente real e verificacao de IDs/status na PDI e no banco/admin. Nenhuma credencial foi consultada nem incidente real criado nesta revisao; aprovacoes funcionais ainda pendentes.
+- Atualizacao em 2026-10-13: operador autorizou atualizar a spec para avancar com backend por etapas e postergar ajustes de integracao com frontend; forneceu localizacao e nomes das variaveis ServiceNow em `.env` e `.env.example`. Valores de credenciais nao foram copiados nem usados; grant/token, acesso a PDI e POST real nao foram testados nesta revisao. A proposta para dados minimos ausentes continua sem aprovacao das duas personas e nao deve ser implementada.
+- Verificacao externa em 2026-10-13: inferencia curta respondeu por `LLM(model="openai/<deployment>", base_url=AZURE_ENDPOINT, api_key=AZURE_API_KEY)` no endpoint Foundry `/openai/v1/`; `AZURE_API_VERSION=2026-09-22` e `2024-05-01-preview` foram rejeitadas pelo provider `azure/...` com `API version not supported`. O runtime agora seleciona o transporte OpenAI para esse endpoint. Um unico POST real via API com decisao deterministica e dados inteiramente sinteticos criou `INC0010002`: run `b4361b29-0f1f-4010-a724-02b60bdb1763`, ticket local `29dcab85-79aa-4218-9bef-76def5dc2433`, status `created`; GET da PDI retornou HTTP 200 e `sys_id`/`number` iguais aos persistidos. Nenhuma chave, token ou credencial foi gravada nesta auditoria; execucao multi-stage CrewAI real permanece nao verificada.

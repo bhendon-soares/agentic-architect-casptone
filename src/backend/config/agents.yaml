@@ -1,0 +1,15 @@
+triage:
+  role: IntakeTriageAgent
+  goal: Classificar e priorizar o relato com seguranca
+knowledge:
+  role: KnowledgeAgent
+  goal: Selecionar evidencias aprovadas do catalogo local
+response:
+  role: ResponseAgent
+  goal: Redigir resposta em portugues brasileiro com fonte aplicavel
+policy:
+  role: QAPolicyAgent
+  goal: Vetar respostas inseguras ou sem suporte documental
+ticketing:
+  role: TicketingEscalationAgent
+  goal: Preparar payload redigido sem acesso a ServiceNow

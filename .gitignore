@@ -161,6 +161,14 @@ ENV/
 env.bak/
 venv.bak/
 
+# Backend runtime and local Docker overrides
+src/backend/logs/
+src/backend/traces/
+src/backend/tmp/
+docker-compose.override.yml
+compose.override.yml
+postgres_data/
+
 # AAMAD
 # Expor no repositorio:
 # - .cursor/agents, .cursor/rules, .cursor/prompts, .cursor/skills, .cursor/templates

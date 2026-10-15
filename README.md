@@ -2,7 +2,7 @@
 
 ## Chat de suporte: demonstracao local
 
-A primeira etapa do frontend e um chat de suporte de TI em pt-BR com dados ficticios e servicos mockados. Nao ha backend, persistencia, console admin nem conexao ServiceNow nesta etapa.
+O frontend e um chat de suporte de TI em pt-BR com dados ficticios e servicos mockados; ainda nao esta conectado ao backend. O backend P0 tem API, persistencia PostgreSQL, catalogo local, fluxo CrewAI e adapter de incidentes mock ou ServiceNow OAuth. O console administrativo e exposto por endpoints HTTP, sem interface grafica integrada.
 
 Requer Node.js >=20.19 ou >=22.12 e npm. Na raiz do projeto:
 
@@ -19,7 +19,33 @@ Abra a URL exibida por `npm run dev` (por padrao `http://localhost:5173/`). Nest
 
 O exemplo de redefinicao de senha ja aparece no campo de entrada. Clique em **Executar** para acompanhar a resposta e a fonte; **Reiniciar** limpa o historico local. A documentacao de contrato e criterios esta em `project-context/2.build/frontend-funcional-spec.md`, com decisoes em `project-context/2.build/frontend.md`.
 
-Ponto de integracao futura (`@integration.eng`): trocar `startRun` e `getRunStatus` em `src/frontend/mockRuns.ts` pela criacao de sessao `POST /api/chat/sessions`, envio `POST /api/chat/sessions/{session_id}/messages` e consulta `GET /api/agent-runs/{agent_run_id}` do SAD. Essas funcoes sao abstracoes do frontend, nao endpoints adicionais; acordar payloads com o backend antes da substituicao.
+Ponto de integracao futura (`@integration.eng`): trocar `startRun` e `getRunStatus` em `src/frontend/mockRuns.ts` pela criacao de sessao `POST /api/chat/sessions` e envio sincrono `POST /api/chat/sessions/{session_id}/messages`; `GET /api/agent-runs/{agent_run_id}` serve a detalhes e reconciliacao, nao e polling obrigatorio. Essas funcoes sao abstracoes do frontend, nao endpoints adicionais; acordar payloads e retries com o backend antes da substituicao.
+
+## Backend P0 local
+
+Requer Python 3.11-3.13, Docker com Compose e PostgreSQL local. Na raiz do projeto, crie `.env` a partir de `.env.example` e ajuste `POSTGRES_PASSWORD` e `DATABASE_URL` com a mesma senha; nao versione esse arquivo. O Compose publica o banco apenas em `127.0.0.1:5432`. Para usar o catalogo deste checkout, mantenha `KNOWLEDGE_BASE_PATH=../../knowledge` (relativo a `src/backend`). A aprovacao nos arquivos em `knowledge/` e somente para demo; mudancas em uma fonte revogam a aprovacao ate revisao.
+
+```bash
+python3.11 -m venv .venv
+.venv/bin/pip install -e 'src/backend[dev]'
+docker compose up --wait db
+cd src/backend
+../../.venv/bin/dotenv -f ../../.env run -- ../../.venv/bin/alembic upgrade head
+../../.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+O backend carrega `.env` da raiz ao iniciar; API interativa em `http://127.0.0.1:8000/docs`. `GET /health` nao testa a conectividade com banco, modelo ou ServiceNow. Para um turno, crie a sessao com `POST /api/chat/sessions` (corpo `{}`), depois envie `{ "message_text": "..." }` para `POST /api/chat/sessions/{session_id}/messages`. `Idempotency-Key` opcional deduplica apenas o envio local. Consultas: `GET /api/chat/sessions/{session_id}`, `/api/agent-runs/{agent_run_id}`, `/api/tickets`, `/api/tickets/{ticket_id}`, `/api/knowledge/sources` e `/api/metrics/summary`. As respostas usam `data`, `error` e `meta`; veja [contrato do backend](project-context/2.build/backend-funcional-spec.md). Nao ha autenticacao/RBAC: exponha somente em ambiente local/demo controlado.
+
+Por padrao `TICKET_ADAPTER_MODE=mock` evita rede ServiceNow e emite identificadores ficticios. Para executar as etapas CrewAI reais, configure `LLM_MODEL` e, para modelo `azure/...`, `AZURE_API_KEY` e `AZURE_ENDPOINT`; ausencia de chave/endpoint gera `RUNTIME_UNAVAILABLE`. Para um endpoint Foundry `/openai/v1/`, o runtime usa o transporte OpenAI da CrewAI com o deployment Azure (sem `api-version` na URL); para outros endpoints Azure, configure `AZURE_API_VERSION` compativel com o recurso. O mock de tickets nao substitui o LLM: os testes injetam respostas deterministicas para exercitar os contratos sem chamadas Azure. Para incidente real, configure `TICKET_ADAPTER_MODE=servicenow` e todas as variaveis `SERVICENOW_*` do template; o adapter usa password grant OAuth em HTTPS e nao tem fallback Basic. Somente escolha `servicenow` em uma PDI autorizada com dados sinteticos/redigidos: o ramo `open_ticket` envia um POST real. Resultado incerto de POST nao pode ser repetido automaticamente; confira o registro remoto e o ticket local antes de qualquer nova tentativa.
+
+Teste e lint, a partir da raiz (o teste de migracao isolada precisa de PostgreSQL acessivel):
+
+```bash
+.venv/bin/python -m pytest -q src/backend/tests
+.venv/bin/ruff check src/backend/app src/backend/tests
+```
+
+Uma chamada de inferencia Azure via CrewAI/Foundry v1 respondeu com sucesso. Um turno de decisao deterministica criou um incidente sintetico na PDI (`INC0010002`), persistiu o ticket local e confirmou `sys_id`/numero por GET remoto. Isso valida a conexao LLM e o adapter real separadamente, nao o fluxo completo de quatro etapas CrewAI com inferencia real; esse gate e as aprovacoes de integracao/seguranca continuam pendentes.
 
 **AAMAD** e um framework aberto, production-grade, para construir, implantar e evoluir aplicacoes multi-agent usando boas praticas de context engineering.  
 Ele sistematiza planejamento orientado por pesquisa, workflows modulares com agentes de IA e pipelines rapidos de MVP/devops para solucoes de IA prontas para contexto enterprise.

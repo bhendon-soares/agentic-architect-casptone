@@ -1,0 +1,15 @@
+triage:
+  output: TriageInput
+  stage: 1
+knowledge:
+  output: EvidenceSet
+  stage: 2
+response:
+  output: ResponseDraft
+  stage: 3
+policy:
+  output: PolicyDecision
+  stage: 4
+ticketing:
+  output: TicketPayloadDraft
+  stage: 5

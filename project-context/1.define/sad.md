@@ -140,9 +140,11 @@ Taxonomia P0:
 
 - Falha de schema de qualquer task interrompe o fluxo sem passar output invalido a `Task.context`, sem POST e com erro redigido ao frontend/admin.
 - Falha de knowledge local nunca permite resposta inventada; escolhe `ask_clarification` ou `open_ticket` conforme regras.
-- Falha ServiceNow preserva ticket local com status de erro reprocessavel e exibe estado no admin.
-- Retry deve ser limitado e idempotente por `agent_run_id`.
+- Falha ServiceNow preserva ticket local `failed` quando a rejeicao prova ausencia de criacao, ou `outcome_unknown` quando a resposta nao confirma se houve criacao; ambos ficam visiveis no admin.
+- `Idempotency-Key` deduplica reenvios locais de um mesmo turno, nao o POST remoto. Nao repetir POST automaticamente apos resultado incerto. Novo envio externo requer reconciliacao manual no ServiceNow e prova de nao criacao; falha confirmada tambem exige acao controlada do operador sobre o mesmo registro.
 - Cancelamento de chamada pelo cliente registra evento `cancelled` quando suportado pelo backend.
+
+Na Build atual, o adapter OAuth e o commit anterior ao POST foram cobertos com HTTP simulado e banco isolado. A validacao de token e incidente real na PDI, assim como reconciliacao operacional de resultados incertos, continuam gates de aceite pendentes.
 
 ### Runtime-Conditional Configuration: CrewAI
 
