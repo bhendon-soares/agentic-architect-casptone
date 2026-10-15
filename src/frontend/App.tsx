@@ -4,9 +4,19 @@ import './style.css'
 
 const example = 'Esqueci a senha da minha conta corporativa de demonstração. Consigo acessar o método oficial de verificação de identidade.'
 
-type Message = { id: number; role: 'user'; text: string } | { id: number; role: 'assistant'; result: RunResult }
+type Message = { id: number; role: 'user'; text: string } | { id: number; role: 'assistant'; result: RunResult } | { id: number; role: 'notice'; text: string }
 type FailedTurn = { input: RunInput; key: string }
 const sessionsKey = 'support-chat-sessions'
+const reviewKey = 'support-chat-ticket-review'
+
+function storedReviewSessions(): string[] {
+  try {
+    const value: unknown = JSON.parse(sessionStorage.getItem(reviewKey) || '[]')
+    return Array.isArray(value) ? value.filter((id): id is string => typeof id === 'string') : []
+  } catch {
+    return []
+  }
+}
 
 function storedSessions(): string[] {
   try {
@@ -19,10 +29,14 @@ function storedSessions(): string[] {
 
 function historyMessages(history: ChatHistory): Message[] {
   const turns = [...history.turns]
+  const outcomes = new Map((history.outcomes ?? []).map((outcome) => [outcome.agent_run_id, outcome]))
   return history.messages.flatMap((message, index): Message[] => {
-    if (message.role === 'user') return [{ id: index, role: 'user' as const, text: message.message_pt_br }]
+    if (message.role === 'user') {
+      const outcome = message.agent_run_id ? outcomes.get(message.agent_run_id) : undefined
+      return [{ id: index * 2, role: 'user', text: message.message_pt_br }, ...(outcome ? [{ id: index * 2 + 1, role: 'notice' as const, text: outcome.message_pt_br }] : [])]
+    }
     const result = turns.shift()
-    return result ? [{ id: index, role: 'assistant' as const, result }] : []
+    return result ? [{ id: index * 2, role: 'assistant', result }] : []
   })
 }
 
@@ -33,6 +47,7 @@ export default function App() {
   const [error, setError] = useState<RunError | null>(null)
   const [failedTurn, setFailedTurn] = useState<FailedTurn | null>(null)
   const [sessions, setSessions] = useState<string[]>(storedSessions)
+  const [reviewSessions, setReviewSessions] = useState<string[]>(storedReviewSessions)
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [updatedAt, setUpdatedAt] = useState(new Date())
   const running = useRef(false)
@@ -51,13 +66,19 @@ export default function App() {
     })
   }
 
+  function markForReview(id: string, required: boolean) {
+    const updated = required ? [id, ...reviewSessions.filter((entry) => entry !== id)] : reviewSessions.filter((entry) => entry !== id)
+    setReviewSessions(updated)
+    sessionStorage.setItem(reviewKey, JSON.stringify(updated))
+  }
+
   const updateStatus = (next: RunStatus) => {
     setStatus(next)
     setUpdatedAt(new Date())
   }
 
   async function execute(input: RunInput, isRetry = false, key: string = crypto.randomUUID()) {
-    if (running.current || !input.message_text.trim()) return
+    if (running.current || !input.message_text.trim() || (!isRetry && activeSession.current && reviewSessions.includes(activeSession.current))) return
     running.current = true
     setError(null)
     setFailedTurn(null)
@@ -73,12 +94,21 @@ export default function App() {
         setSessionId(id)
         rememberSession(id)
       }
+      markForReview(id, true)
       const result = await sendMessage(id, input, key)
+      markForReview(id, false)
       setMessages((current) => [...current, { id: ++nextId.current, role: 'assistant', result }])
       setDraft('')
       updateStatus('done')
     } catch (cause) {
       const failure = cause as RunError
+      if (activeSession.current && failure?.code && !['TICKET_CREATE_FAILED', 'TICKET_OUTCOME_UNKNOWN'].includes(failure.code)) markForReview(activeSession.current, false)
+      if (failure?.code === 'MINIMUM_TICKET_DATA_MISSING') {
+        setMessages((current) => [...current, { id: ++nextId.current, role: 'notice', text: failure.message }])
+        setDraft('')
+        updateStatus('done')
+        return
+      }
       setError(failure?.code && failure?.message ? failure : { code: 'RUN_FAILED', message: 'Não foi possível concluir o atendimento.', retryable: true })
       setFailedTurn({ input, key })
       setDraft(input.message_text)
@@ -95,6 +125,7 @@ export default function App() {
 
   async function reset() {
     if (running.current) return
+    if (activeSession.current && reviewSessions.includes(activeSession.current) && !window.confirm('A tentativa anterior pode ter criado um incidente. Consulte o suporte antes de solicitar outro. Iniciar uma nova conversa?')) return
     running.current = true
     updateStatus('running')
     try {
@@ -140,6 +171,7 @@ export default function App() {
   }
 
   const statusLabel = status === 'running' ? 'em andamento' : status === 'done' ? 'concluído' : 'ocioso'
+  const needsReview = sessionId !== null && reviewSessions.includes(sessionId)
 
   return (
     <div className="app-shell">
@@ -168,10 +200,10 @@ export default function App() {
             <span className="message-avatar" aria-hidden="true">{message.role === 'user' ? 'EU' : 'TI'}</span>
             <div className="message-content">
               <span className="message-author">{message.role === 'user' ? 'Você' : 'Suporte TI · demonstração'}</span>
-              {message.role === 'user' ? <p>{message.text}</p> : <>
+              {message.role === 'user' || message.role === 'notice' ? <p>{message.text}</p> : <>
                 <p className="result-summary">{message.result.summary}</p>
                 <p>{message.result.message_pt_br}</p>
-                {message.result.ticket && <p className="ticket-number">Incidente: {message.result.ticket.servicenow_number ?? message.result.ticket.status}</p>}
+                {message.result.ticket && <p className="ticket-number">Incidente: {message.result.ticket.servicenow_number ?? 'Número pendente'} · {message.result.ticket.status === 'created' ? 'Criado' : message.result.ticket.status}</p>}
                 {message.result.sources.map((source) => <aside className="source" key={source.path} aria-label="Fonte da orientação">
                   <span className="source-kicker">FONTE LOCAL</span>
                   <strong>{source.title}</strong>
@@ -185,11 +217,11 @@ export default function App() {
         </section>
 
         <div className="composer-wrap">
-          {error && <div className="error-banner" role="alert"><strong>Falha técnica</strong><span>{error.message}{['TICKET_CREATE_FAILED', 'TICKET_OUTCOME_UNKNOWN'].includes(error.code) && ' Consulte o suporte antes de solicitar outro incidente; esta tentativa não fará novo envio.'}</span><button type="button" onClick={() => failedTurn && void execute(failedTurn.input, true, failedTurn.key)} disabled={!failedTurn || status === 'running'}>Tentar novamente</button></div>}
+          {(error || (needsReview && status !== 'running')) && <div className="error-banner" role="alert"><strong>{error ? 'Falha técnica' : 'Atendimento requer verificação'}</strong><span>{error ? error.message : 'A chave da tentativa anterior não está mais disponível nesta aba.'}{needsReview && ' Consulte o suporte antes de solicitar outro incidente; esta conversa não fará um novo envio.'}</span>{error && <button type="button" onClick={() => failedTurn && void execute(failedTurn.input, true, failedTurn.key)} disabled={!failedTurn || status === 'running'}>Tentar novamente</button>}</div>}
           <form className="composer" onSubmit={submit}>
             <label htmlFor="problem">Descreva seu problema</label>
             <textarea id="problem" value={draft} onChange={(event) => setDraft(event.target.value)} disabled={status === 'running'} rows={3} maxLength={2000} placeholder="Descreva o que está acontecendo…" />
-            <div className="composer-footer"><span>Cenário de demonstração: redefinição de senha</span><div className="actions"><button className="reset-button" type="button" onClick={() => void reset()} disabled={status === 'running'}>Reiniciar</button><button className="execute-button" type="submit" disabled={status === 'running' || !draft.trim() || (!!failedTurn && draft.trim() === failedTurn.input.message_text.trim())}>{status === 'running' ? 'Em andamento…' : 'Executar'}</button></div></div>
+            <div className="composer-footer"><span>Cenário de demonstração: redefinição de senha</span><div className="actions"><button className="reset-button" type="button" onClick={() => void reset()} disabled={status === 'running'}>Reiniciar</button><button className="execute-button" type="submit" disabled={status === 'running' || !draft.trim() || needsReview || (!!failedTurn && draft.trim() === failedTurn.input.message_text.trim())}>{status === 'running' ? 'Em andamento…' : 'Executar'}</button></div></div>
           </form>
           <p className="privacy-note">Não informe senhas, tokens ou credenciais neste chat.</p>
         </div>

@@ -12,8 +12,9 @@ export type RunResult = {
 }
 export type ChatHistory = {
     session_id: string
-    messages: { message_id: string; role: 'user' | 'assistant'; message_pt_br: string; created_at: string }[]
+    messages: { message_id: string; agent_run_id: string | null; role: 'user' | 'assistant'; message_pt_br: string; created_at: string }[]
     turns: RunResult[]
+    outcomes: { agent_run_id: string; code: string; message_pt_br: string }[]
 }
 
 export type AdminConversation = {

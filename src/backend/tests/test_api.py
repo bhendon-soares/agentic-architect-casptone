@@ -72,6 +72,37 @@ def test_session_and_admin_reads(client: TestClient) -> None:
     assert client.get("/api/metrics/summary").json()["data"]["total_conversations"] == 1
 
 
+def test_missing_ticket_data_after_clarification(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    def workflow(message, clarification_count, db, agent_run_id):
+        assert clarification_count == 1
+        raise InvalidAgentOutput("Minimum ticket data missing")
+
+    monkeypatch.setattr("app.main.run_workflow", workflow)
+    session_id = client.post("/api/chat/sessions", json={}).json()["data"]["session_id"]
+    db = next(app.dependency_overrides[get_session]())
+    db.get(ChatSession, session_id).clarification_count = 1
+    db.commit()
+    url = f"/api/chat/sessions/{session_id}/messages"
+    body = {"message_text": "Nao sei explicar"}
+    headers = {"Idempotency-Key": "missing-data"}
+    response = client.post(url, json=body, headers=headers)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "MINIMUM_TICKET_DATA_MISSING"
+    assert response.json()["error"]["retryable"] is False
+    assert client.post(url, json=body, headers=headers).status_code == 422
+    run_id = response.json()["meta"]["agent_run_id"]
+    history = client.get(f"/api/chat/sessions/{session_id}").json()["data"]
+    assert history["turns"] == []
+    assert history["messages"][0]["agent_run_id"] == run_id
+    assert history["outcomes"] == [{
+        "agent_run_id": run_id,
+        "code": "MINIMUM_TICKET_DATA_MISSING",
+        "message_pt_br": response.json()["error"]["message"],
+    }]
+    assert client.get(f"/api/agent-runs/{run_id}").json()["data"]["final_action"] is None
+    assert client.get("/api/tickets").json()["data"]["total"] == 0
+
+
 def test_admin_conversations_order_pagination_and_detail(client: TestClient) -> None:
     db = next(app.dependency_overrides[get_session]())
     start = datetime(2026, 10, 15, 12, tzinfo=timezone.utc)
@@ -242,6 +273,41 @@ def test_blocked_before_crew(
     history = client.get(f"/api/chat/sessions/{session_id}").json()["data"]
     assert "sentinel-42" not in str(history)
     assert history["messages"][0]["message_pt_br"].count("[REDACTED]") == 1
+
+
+def test_low_confidence_after_question_creates_mock_ticket(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TICKET_ADAPTER_MODE", "mock")
+
+    def workflow(message, clarification_count, db, agent_run_id):
+        action = "open_ticket" if clarification_count else "ask_clarification"
+        return {
+            "action": action,
+            "message": "Qual servico?" if not clarification_count else "Encaminhado.",
+            "summary": "Falha de acesso.",
+            "sources": [],
+            "triage": {
+                "internal_category": "app_access", "servicenow_category": "software",
+                "impact": 3, "urgency": 3, "resulting_priority": "P4",
+                "confidence": 0.69, "risk_flags": [], "initial_action": action,
+            },
+            "payload": {
+                "short_description": "Falha de acesso",
+                "description": "Acesso indisponivel", "impact": 3, "urgency": 3,
+                "category": "software",
+            } if clarification_count else None,
+        }
+
+    monkeypatch.setattr("app.main.run_workflow", workflow)
+    session_id = client.post("/api/chat/sessions", json={}).json()["data"]["session_id"]
+    path = f"/api/chat/sessions/{session_id}/messages"
+    first = client.post(path, json={"message_text": "Nao consigo acessar o portal"})
+    assert first.json()["data"]["final_action"] == "ask_clarification"
+    second = client.post(path, json={"message_text": "Portal interno indisponivel"})
+    assert second.status_code == 200
+    assert second.json()["data"]["final_action"] == "open_ticket"
+    assert second.json()["data"]["ticket"]["status"] == "created"
 
 
 def test_dataset_tc012_blocks_before_crew(

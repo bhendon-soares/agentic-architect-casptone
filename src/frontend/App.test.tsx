@@ -6,6 +6,7 @@ import AdminConsole from './AdminConsole'
 afterEach(() => {
   cleanup()
   localStorage.clear()
+  sessionStorage.clear()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
 })
@@ -44,6 +45,37 @@ test('creates a session, posts the message and displays the sourced result', asy
   expect(screen.getByText('knowledge/password_reset.md')).toBeTruthy()
   expect(screen.getByText(/Use o fluxo oficial de redefinição de senha/)).toBeTruthy()
   expect(JSON.parse(localStorage.getItem('support-chat-sessions')!)).toEqual(['session-1'])
+})
+
+test.each([
+  ['respond', 'Orientação disponível.', null],
+  ['ask_clarification', 'Qual conta apresenta o problema?', null],
+  ['open_ticket', 'Incidente criado.', { servicenow_number: 'INC0010001', status: 'created' }],
+  ['blocked', 'Não posso ajudar com esse pedido.', null],
+])('renders the %s result without treating it as an error', async (finalAction, answer, ticket) => {
+  const fetchMock = vi.fn().mockResolvedValueOnce(reply({ session_id: 'session-1' }))
+    .mockResolvedValueOnce(reply({ ...turn, final_action: finalAction, message_pt_br: answer, ticket, sources: finalAction === 'respond' ? turn.sources : [] }))
+  vi.stubGlobal('fetch', fetchMock)
+  render(<App />)
+  fireEvent.click(screen.getByRole('button', { name: 'Executar' }))
+  expect(await screen.findByText(answer)).toBeTruthy()
+  expect(screen.getByText('Atendimento: concluído')).toBeTruthy()
+  expect(screen.queryByRole('alert')).toBeNull()
+  if (ticket) expect(screen.getByText(/INC0010001.*Criado/)).toBeTruthy()
+  if (finalAction === 'respond') expect(screen.getByRole('complementary', { name: 'Fonte da orientação' })).toBeTruthy()
+})
+
+test('shows progress without a lost-key warning while a message is in flight', async () => {
+  let resolveTurn!: (response: Response) => void
+  const fetchMock = vi.fn().mockResolvedValueOnce(reply({ session_id: 'session-1' }))
+    .mockImplementationOnce(() => new Promise<Response>((resolve) => { resolveTurn = resolve }))
+  vi.stubGlobal('fetch', fetchMock)
+  render(<App />)
+  fireEvent.click(screen.getByRole('button', { name: 'Executar' }))
+  expect(await screen.findByText('Consultando a orientação local…')).toBeTruthy()
+  expect(screen.queryByRole('alert')).toBeNull()
+  resolveTurn(reply(turn))
+  expect(await screen.findByText(turn.message_pt_br)).toBeTruthy()
 })
 
 test('restarts in a new session and restores the old conversation from the server', async () => {
@@ -87,6 +119,31 @@ test('loads a saved conversation after reopening the page', async () => {
   expect(fetchMock).toHaveBeenCalledWith('/api/chat/sessions/session-1', undefined)
 })
 
+test('keeps the missing-data outcome visible after reload without technical retry', async () => {
+  const notice = 'Ainda faltam dados. Procure o suporte pelo canal oficial.'
+  const history = {
+    session_id: 'session-1', turns: [],
+    messages: [{ message_id: 'user-1', agent_run_id: 'run-1', role: 'user', message_pt_br: 'Ainda não sei', created_at: '2026-10-15T10:00:00Z' }],
+    outcomes: [{ agent_run_id: 'run-1', code: 'MINIMUM_TICKET_DATA_MISSING', message_pt_br: notice }],
+  }
+  const fetchMock = vi.fn().mockResolvedValueOnce(reply({ session_id: 'session-1' }))
+    .mockResolvedValueOnce(reply({ code: 'MINIMUM_TICKET_DATA_MISSING', message: notice, retryable: false }, 422))
+    .mockResolvedValueOnce(reply(history))
+  vi.stubGlobal('fetch', fetchMock)
+  render(<App />)
+  fireEvent.click(screen.getByRole('button', { name: 'Executar' }))
+  expect(await screen.findByText(notice)).toBeTruthy()
+  expect(screen.queryByRole('alert')).toBeNull()
+  expect(screen.queryByRole('button', { name: 'Tentar novamente' })).toBeNull()
+  expect(fetchMock).toHaveBeenCalledTimes(2)
+  cleanup()
+  render(<App />)
+  expect(await screen.findByText(notice)).toBeTruthy()
+  expect(screen.getByText('Ainda não sei')).toBeTruthy()
+  expect(screen.queryByRole('button', { name: 'Tentar novamente' })).toBeNull()
+  expect(fetchMock).toHaveBeenCalledTimes(3)
+})
+
 test('retries a failed ticket with the same idempotency key and without a second user message', async () => {
   const failed = { code: 'TICKET_OUTCOME_UNKNOWN', message: 'Consulte o suporte.', retryable: false }
   const fetchMock = vi.fn().mockResolvedValueOnce(reply({ session_id: 'session-1' }))
@@ -105,6 +162,64 @@ test('retries a failed ticket with the same idempotency key and without a second
   expect(within(screen.getByRole('region', { name: 'Histórico da conversa' })).getAllByText(/Esqueci a senha/)).toHaveLength(1)
 })
 
+test.each(['TICKET_CREATE_FAILED', 'TICKET_OUTCOME_UNKNOWN'])('prevents a new POST after %s even if the draft is edited', async (code) => {
+  const fetchMock = vi.fn().mockResolvedValueOnce(reply({ session_id: 'session-1' }))
+    .mockResolvedValueOnce(reply({ code, message: 'Consulte o suporte.', retryable: false }, 502))
+  vi.stubGlobal('fetch', fetchMock)
+  render(<App />)
+  fireEvent.click(screen.getByRole('button', { name: 'Executar' }))
+  expect(await screen.findByRole('alert')).toHaveProperty('textContent', expect.stringContaining('Consulte o suporte'))
+  fireEvent.change(screen.getByRole('textbox', { name: 'Descreva seu problema' }), { target: { value: 'Outro texto' } })
+  expect(screen.getByRole('button', { name: 'Executar' }).hasAttribute('disabled')).toBe(true)
+  fireEvent.click(screen.getByRole('button', { name: 'Executar' }))
+  expect(fetchMock).toHaveBeenCalledTimes(2)
+})
+
+test('does not offer a fresh POST or retry after reloading an uncertain ticket', async () => {
+  const fetchMock = vi.fn().mockResolvedValueOnce(reply({ session_id: 'session-1' }))
+    .mockResolvedValueOnce(reply({ code: 'TICKET_OUTCOME_UNKNOWN', message: 'Resultado incerto.', retryable: false }, 504))
+    .mockResolvedValueOnce(reply({ session_id: 'session-1', turns: [], messages: [] }))
+  vi.stubGlobal('fetch', fetchMock)
+  render(<App />)
+  fireEvent.click(screen.getByRole('button', { name: 'Executar' }))
+  expect(await screen.findByRole('alert')).toHaveProperty('textContent', expect.stringContaining('Resultado incerto'))
+  cleanup()
+  render(<App />)
+  expect(await screen.findByRole('alert')).toHaveProperty('textContent', expect.stringContaining('Consulte o suporte'))
+  expect(screen.queryByRole('button', { name: 'Tentar novamente' })).toBeNull()
+  expect(screen.getByRole('button', { name: 'Executar' }).hasAttribute('disabled')).toBe(true)
+  expect(fetchMock).toHaveBeenCalledTimes(3)
+})
+
+test('allows a new message after a non-ticket API failure', async () => {
+  const fetchMock = vi.fn().mockResolvedValueOnce(reply({ session_id: 'session-1' }))
+    .mockResolvedValueOnce(reply({ code: 'INVALID_INPUT', message: 'Revise a mensagem.', retryable: true }, 400))
+    .mockResolvedValueOnce(reply(turn))
+  vi.stubGlobal('fetch', fetchMock)
+  render(<App />)
+  fireEvent.click(screen.getByRole('button', { name: 'Executar' }))
+  expect(await screen.findByRole('alert')).toHaveProperty('textContent', expect.stringContaining('Revise a mensagem'))
+  fireEvent.change(screen.getByRole('textbox', { name: 'Descreva seu problema' }), { target: { value: 'Mensagem revisada' } })
+  expect(screen.getByRole('button', { name: 'Executar' }).hasAttribute('disabled')).toBe(false)
+  fireEvent.click(screen.getByRole('button', { name: 'Executar' }))
+  expect(await screen.findByText(turn.message_pt_br)).toBeTruthy()
+  expect(fetchMock).toHaveBeenCalledTimes(3)
+})
+
+test('requires an explicit warning acknowledgment before restarting an uncertain ticket', async () => {
+  const fetchMock = vi.fn().mockResolvedValueOnce(reply({ session_id: 'session-1' }))
+    .mockResolvedValueOnce(reply({ code: 'TICKET_OUTCOME_UNKNOWN', message: 'Resultado incerto.', retryable: false }, 504))
+  vi.stubGlobal('fetch', fetchMock)
+  const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+  render(<App />)
+  fireEvent.click(screen.getByRole('button', { name: 'Executar' }))
+  expect(await screen.findByRole('alert')).toBeTruthy()
+  fireEvent.click(screen.getByRole('button', { name: 'Reiniciar' }))
+  expect(confirm).toHaveBeenCalledWith(expect.stringContaining('Consulte o suporte'))
+  expect(fetchMock).toHaveBeenCalledTimes(2)
+  expect(screen.getByRole('button', { name: 'Executar' }).hasAttribute('disabled')).toBe(true)
+})
+
 test('admin console loads live metrics, tickets and sources and pages through tickets', async () => {
   const ticket = { ticket_id: 'ticket-1', session_id: 'session-1', agent_run_id: 'run-1', status: 'created', servicenow_number: 'INC-123', internal_category: 'password_reset', created_at: '2026-10-15T10:00:00Z' }
   const fetchMock = vi.fn((url: string) => {
@@ -121,7 +236,10 @@ test('admin console loads live metrics, tickets and sources and pages through ti
   expect(await screen.findByText('INC-123')).toBeTruthy()
   expect(within(screen.getByRole('region', { name: 'Conversas' })).getAllByText('Conversa session-')).toHaveLength(2)
   expect(within(screen.getByRole('region', { name: 'Conversas' })).getByText('Bloqueado').classList.contains('blocked')).toBe(true)
-  expect(within(screen.getByRole('region', { name: 'Métricas' })).getByText('4')).toBeTruthy()
+  const metrics = screen.getByRole('region', { name: 'Métricas' })
+  for (const [label, value] of [['Conversas', '4'], ['Tickets criados', '1'], ['Respostas com fonte', '2'], ['Pedidos bloqueados', '1']]) {
+    expect(within(metrics).getByText(label).parentElement?.textContent).toContain(value)
+  }
   expect(screen.getByText('Redefinição de senha')).toBeTruthy()
   fireEvent.click(screen.getByRole('button', { name: 'Próxima' }))
   expect(await screen.findByText('21–21 de 21')).toBeTruthy()
@@ -190,4 +308,22 @@ test('admin console can inspect a failed ticket run without a completed turn', a
   fireEvent.click(within(screen.getByRole('region', { name: 'Conversa e decisões' })).getByRole('button', { name: 'Ver eventos' }))
   expect(await screen.findByText('backend · ticket')).toBeTruthy()
   expect(screen.getAllByText(/TICKET_OUTCOME_UNKNOWN/).length).toBeGreaterThan(0)
+})
+
+test('admin console keeps available data visible when another request fails', async () => {
+  let resolveMetrics!: (response: Response) => void
+  const fetchMock = vi.fn((url: string) => {
+    if (url === '/api/metrics/summary') return new Promise<Response>((resolve) => { resolveMetrics = resolve })
+    if (url.includes('/api/tickets?')) return Promise.resolve(reply({ code: 'UNAVAILABLE', message: 'Temporariamente indisponível.', retryable: true }, 503))
+    if (url === '/api/knowledge/sources') return Promise.resolve(reply({ items: [] }))
+    if (url.includes('/api/admin/conversations?')) return Promise.resolve(reply({ items: [], total: 0 }))
+    return Promise.reject(new Error(`Unexpected URL: ${url}`))
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  render(<AdminConsole />)
+  expect(screen.getByRole('status').textContent).toContain('Carregando dados')
+  resolveMetrics(reply({ total_conversations: 3, tickets_created: 0, responses_with_source: 1, blocked_requests: 0 }))
+  expect(await screen.findByRole('alert')).toHaveProperty('textContent', expect.stringContaining('Alguns dados'))
+  expect(within(screen.getByRole('region', { name: 'Métricas' })).getByText('3')).toBeTruthy()
+  expect(screen.getByText('Nenhuma conversa registrada.')).toBeTruthy()
 })

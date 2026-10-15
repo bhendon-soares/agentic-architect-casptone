@@ -121,6 +121,12 @@ class MessageInput(BaseModel):
     message_text: str = Field(min_length=1, max_length=2000)
 
 
+MINIMUM_TICKET_DATA_MESSAGE = (
+    "Nao ha dados suficientes para abrir um incidente. "
+    "Procure o suporte pelo canal oficial."
+)
+
+
 def failure(
     request: Request, code: str, status: int, agent_run_id: str | None = None
 ) -> JSONResponse:
@@ -136,6 +142,7 @@ def failure(
         ),
         "RUNTIME_UNAVAILABLE": "Atendimento temporariamente indisponivel.",
         "AGENT_OUTPUT_INVALID": "Nao foi possivel validar a resposta do atendimento.",
+        "MINIMUM_TICKET_DATA_MISSING": MINIMUM_TICKET_DATA_MESSAGE,
     }
     return JSONResponse(
         status_code=status,
@@ -242,6 +249,7 @@ def post_message(
                     "TICKET_CREATE_FAILED": 502,
                     "TICKET_OUTCOME_UNKNOWN": 504,
                     "RUNTIME_UNAVAILABLE": 503,
+                    "MINIMUM_TICKET_DATA_MISSING": 422,
                 }.get(previous.error_code, 502)
                 return failure(
                     request, previous.error_code, status, previous.agent_run_id
@@ -348,6 +356,8 @@ def post_message(
             if isinstance(exc, InvalidAgentOutput)
             else "WORKFLOW_FAILED"
         )
+        if reason == "MINIMUM_TICKET_DATA_MISSING":
+            code = reason
         run.status, run.error_code = "failed", code
         db.add(
             AgentEvent(
@@ -360,7 +370,7 @@ def post_message(
             )
         )
         db.commit()
-        return failure(request, code, 502, run.agent_run_id)
+        return failure(request, code, 422 if code == "MINIMUM_TICKET_DATA_MISSING" else 502, run.agent_run_id)
 
     action = result["action"]
     if action not in ("respond", "ask_clarification", "open_ticket", "blocked") or (
@@ -399,7 +409,10 @@ def post_message(
                 }
             )
             validated_payload = TicketPayloadDraft.model_validate(payload)
-            assert validated_triage.confidence >= 0.70
+            assert (
+                validated_triage.confidence >= 0.70
+                or record.clarification_count == 1
+            )
             assert not validated_triage.missing_required_fields
             assert validated_payload.impact == validated_triage.impact
             assert validated_payload.urgency == validated_triage.urgency
@@ -508,6 +521,7 @@ def get_chat_session(
             "messages": [
                 {
                     "message_id": message.message_id,
+                    "agent_run_id": message.agent_run_id,
                     "role": message.role,
                     "message_pt_br": message.message_pt_br,
                     "created_at": message.created_at,
@@ -515,6 +529,15 @@ def get_chat_session(
                 for message in messages
             ],
             "turns": [run.response_data for run in runs if run.response_data],
+            "outcomes": [
+                {
+                    "agent_run_id": run.agent_run_id,
+                    "code": run.error_code,
+                    "message_pt_br": MINIMUM_TICKET_DATA_MESSAGE,
+                }
+                for run in runs
+                if run.error_code == "MINIMUM_TICKET_DATA_MISSING"
+            ],
         },
         request,
     )

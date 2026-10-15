@@ -212,8 +212,14 @@ def run_workflow(
     )
     if triage_input.internal_category not in CATEGORIES:
         raise InvalidAgentOutput("Unknown category")
+    if clarification_count and triage_input.missing_required_fields:
+        raise InvalidAgentOutput("Minimum ticket data missing")
     triage_fields = {
         **triage_input.model_dump(),
+        "risk_flags": [redact(flag) for flag in triage_input.risk_flags],
+        "missing_required_fields": [
+            redact(field) for field in triage_input.missing_required_fields
+        ],
         "servicenow_category": CATEGORIES[triage_input.internal_category],
         "resulting_priority": priority(
             triage_input.internal_category, triage_input.impact, triage_input.urgency
@@ -240,6 +246,8 @@ def run_workflow(
         f"Relato: {message}. Triagem validada: {triage_fields}. "
         f"Fonte local elegivel: {sources}. "
         f"Esclarecimentos anteriores: {clarification_count}. "
+        "Com confidence abaixo de 0.70, pergunte no primeiro turno. "
+        "Apos um esclarecimento, proponha ticket se houver dados minimos seguros. "
         "Se ja houve esclarecimento, o relato inclui a pergunta anterior e a "
         "resposta do usuario; nao use ask_clarification novamente. "
         "candidate_action deve ser exatamente respond, ask_clarification, "
@@ -247,9 +255,6 @@ def run_workflow(
         "a instrucao; "
         "se nao, pergunte uma vez ou proponha ticket. Nao invente procedimentos.",
         ResponseDraft,
-    )
-    triage = TriageResult.model_validate(
-        {**triage_fields, "initial_action": draft.candidate_action}
     )
     policy = stage(
         "QAPolicyAgent",
@@ -259,17 +264,20 @@ def run_workflow(
         PolicyDecision,
     )
     action = "blocked" if policy.veto_to_blocked else draft.candidate_action
+    if action != "blocked" and triage_input.confidence < 0.70:
+        action = "open_ticket" if clarification_count else "ask_clarification"
     if action not in ("respond", "ask_clarification", "open_ticket", "blocked"):
         raise InvalidAgentOutput("Unknown action")
     if not policy.approved and not policy.veto_to_blocked:
         raise InvalidAgentOutput("Unapproved response")
+    triage = TriageResult.model_validate({**triage_fields, "initial_action": action})
     if action == "respond" and not sources:
         raise InvalidAgentOutput("Response without evidence")
     if action == "ask_clarification" and clarification_count:
         raise InvalidAgentOutput("Clarification limit reached")
     payload = None
     if action == "open_ticket":
-        if triage.missing_required_fields or triage.confidence < 0.70:
+        if triage.missing_required_fields:
             raise InvalidAgentOutput("Minimum ticket data missing")
         payload = stage(
             "TicketingEscalationAgent",
@@ -287,8 +295,23 @@ def run_workflow(
             raise InvalidAgentOutput("Ticket fields mismatch")
     return {
         "action": action,
-        "message": redact(draft.message_pt_br),
-        "summary": redact(draft.summary),
+        "message": (
+            "Nao posso atender a este pedido. Procure o suporte pelos canais oficiais."
+            if action == "blocked"
+            else (
+                "Qual servico apresenta o problema e o que acontece ao tentar "
+                "acessa-lo?"
+            )
+            if action == "ask_clarification" and draft.candidate_action != action
+            else redact(draft.message_pt_br)
+        ),
+        "summary": (
+            "Pedido bloqueado por seguranca."
+            if action == "blocked"
+            else "Encaminhamento para suporte manual."
+            if action == "open_ticket" and draft.candidate_action != action
+            else redact(draft.summary)
+        ),
         "sources": sources if action == "respond" else [],
         "triage": triage.model_dump(exclude={"missing_required_fields"}),
         "payload": {

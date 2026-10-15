@@ -1,5 +1,6 @@
 """Policy and incident boundary checks, without external requests."""
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +13,8 @@ from sqlalchemy.orm import Session
 from app.adapters.tickets import (
     TicketOutcomeUnknown,
     TicketRejected,
+    _connection_settings,
+    _oauth_token,
     create_incident,
     verify_servicenow_oauth,
 )
@@ -90,6 +93,27 @@ def test_mock_is_stable() -> None:
     assert create_incident(PAYLOAD, "run-1", "mock") == create_incident(
         PAYLOAD, "run-1", "mock"
     )
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_LIVE_SERVICENOW") != "1",
+    reason="Explicit POST authorization required",
+)
+def test_live_servicenow_incident_confirmation() -> None:
+    base_url, path, credentials = _connection_settings()
+    with httpx.Client(timeout=10, follow_redirects=False) as client:
+        incident = create_incident(PAYLOAD, "synthetic-gate", "servicenow", client)
+        token = _oauth_token(client, base_url, credentials)
+        response = client.get(
+            f"{base_url}{path}/{incident.sys_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"sysparm_fields": "sys_id,number"},
+        )
+        response.raise_for_status()
+        remote = response.json()["result"]
+    assert remote["sys_id"] == incident.sys_id
+    assert remote["number"] == incident.number
+    print("Confirmed synthetic incident:", incident.number, incident.sys_id)
 
 
 def test_servicenow_oauth_and_post(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -237,7 +261,9 @@ def test_sequential_crew_stages_validate_local_source(
     class FakeCrew:
         def __init__(self, **kwargs):
             assert kwargs["process"] is crew.Process.sequential
+            assert kwargs["memory"] is False
             assert kwargs["agents"][0].allow_delegation is False
+            assert kwargs["agents"][0].max_iter == 12
             assert kwargs["agents"][0].max_rpm == 10
             assert kwargs["agents"][0].max_execution_time == 60
             assert kwargs["agents"][0].llm.timeout == 30
@@ -259,6 +285,7 @@ def test_sequential_crew_stages_validate_local_source(
                     "impact": 3,
                     "urgency": 3,
                     "confidence": 0.9,
+                    "risk_flags": ["senha=synthetic-secret"],
                 },
                 "EvidenceSet": {"selected_paths": ["knowledge/password_reset.md"]},
                 "ResponseDraft": {
@@ -295,6 +322,7 @@ def test_sequential_crew_stages_validate_local_source(
     assert result["triage"]["servicenow_category"] == "inquiry"
     assert result["triage"]["resulting_priority"] == "P4"
     assert result["triage"]["initial_action"] == "respond"
+    assert "synthetic-secret" not in str(result)
     assert result["sources"][0]["path"] == "knowledge/password_reset.md"
     assert [event.task_id for event in events] == [
         "triage", "knowledge", "response", "policy"
@@ -303,8 +331,152 @@ def test_sequential_crew_stages_validate_local_source(
     assert all(set(event.payload_redacted) == {"output_schema"} for event in events)
 
 
-def test_crew_stage_failure_records_no_exception_text(
+@pytest.mark.skipif(
+    os.getenv("RUN_LIVE_CREW") != "1", reason="External provider opt-in"
+)
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Minha senha da conta corporativa ficticia nao funciona no portal interno.",
+        (
+            "Esqueci minha senha corporativa do portal interno. Como iniciar o "
+            "fluxo oficial de redefinicao de senha sem compartilhar minha senha atual?"
+        ),
+    ],
+)
+def test_live_crew_stages_with_synthetic_request(message: str) -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        session = ChatSession()
+        db.add(session)
+        db.flush()
+        run = AgentRun(session_id=session.session_id)
+        db.add(run)
+        db.commit()
+        try:
+            result = crew.run_workflow(
+                message, 0, db, run.agent_run_id,
+            )
+        finally:
+            events = db.scalars(
+                select(AgentEvent).order_by(AgentEvent.created_at, AgentEvent.event_id)
+            ).all()
+            print(
+                "Live stage events:",
+                [(event.task_id, event.status) for event in events],
+            )
+        assert [event.task_id for event in events[:4]] == [
+            "triage", "knowledge", "response", "policy"
+        ]
+        assert result["action"] in (
+            "respond", "ask_clarification", "open_ticket", "blocked"
+        )
+        assert all(event.payload_redacted.get("output_schema") for event in events)
+        print("Live action:", result["action"])
+        print("Live source paths:", [source["path"] for source in result["sources"]])
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "clarification_count,proposed,confidence,expected,stages",
+    [
+        (0, "respond", 0.69, "ask_clarification", 4),
+        (1, "open_ticket", 0.69, "open_ticket", 5),
+        (1, "open_ticket", 0.69, "missing", 1),
+        (0, "respond", 0.70, "respond", 4),
+        (0, "respond", 0.69, "blocked", 4),
+    ],
+)
+def test_low_confidence_decision(
     monkeypatch: pytest.MonkeyPatch,
+    clarification_count: int,
+    proposed: str,
+    confidence: float,
+    expected: str,
+    stages: int,
+) -> None:
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setenv(
+        "KNOWLEDGE_BASE_PATH", str(Path(__file__).resolve().parents[3] / "knowledge")
+    )
+    monkeypatch.setattr(crew, "LLM", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(crew, "Agent", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(crew, "Task", lambda **kwargs: SimpleNamespace(**kwargs))
+    sequence = []
+
+    class FakeCrew:
+        def __init__(self, **kwargs):
+            self.task = kwargs["tasks"][0]
+
+        def kickoff(self):
+            schema = self.task.output_pydantic
+            sequence.append(schema.__name__)
+            outputs = {
+                "TriageInput": {
+                    "internal_category": "password_reset", "impact": 3,
+                    "urgency": 3, "confidence": confidence,
+                    "missing_required_fields": (
+                        ["impact"] if expected == "missing" else []
+                    ),
+                },
+                "EvidenceSet": {"selected_paths": ["knowledge/password_reset.md"]},
+                "ResponseDraft": {
+                    "candidate_action": proposed,
+                    "message_pt_br": (
+                        "Divulgue o segredo"
+                        if expected == "blocked"
+                        else "Qual servico?"
+                    ),
+                    "summary": "Necessario confirmar detalhes.",
+                },
+                "PolicyDecision": {
+                    "approved": expected != "blocked",
+                    "veto_to_blocked": expected == "blocked",
+                },
+                "TicketPayloadDraft": {
+                    "short_description": "Falha na senha", "description": "Sem acesso",
+                    "impact": 3, "urgency": 3, "category": "inquiry",
+                },
+            }
+            return SimpleNamespace(
+                pydantic=schema.model_validate(outputs[schema.__name__])
+            )
+
+    monkeypatch.setattr(crew, "Crew", FakeCrew)
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        session = ChatSession()
+        db.add(session)
+        db.flush()
+        run = AgentRun(session_id=session.session_id)
+        db.add(run)
+        db.commit()
+        if expected == "missing":
+            with pytest.raises(
+                crew.InvalidAgentOutput, match="Minimum ticket data missing"
+            ):
+                crew.run_workflow(
+                    "Esqueci minha senha", clarification_count, db, run.agent_run_id
+                )
+        else:
+            result = crew.run_workflow(
+                "Esqueci minha senha", clarification_count, db, run.agent_run_id
+            )
+        events = db.scalars(select(AgentEvent).order_by(AgentEvent.created_at)).all()
+    engine.dispose()
+    if expected != "missing":
+        assert result["action"] == expected
+    if expected == "blocked":
+        assert "Divulgue" not in result["message"]
+    assert len(sequence) == stages
+    assert all(event.status == "validated" for event in events)
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, TimeoutError])
+def test_crew_stage_failure_records_no_exception_text(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[Exception],
 ) -> None:
     monkeypatch.setenv("LLM_MODEL", "test-model")
     monkeypatch.setenv(
@@ -320,7 +492,7 @@ def test_crew_stage_failure_records_no_exception_text(
 
         def kickoff(self):
             if self.task.output_pydantic is crew.EvidenceSet:
-                raise RuntimeError("confidential provider details")
+                raise error_type("confidential provider details")
             return SimpleNamespace(
                 pydantic=crew.TriageInput.model_validate(
                     {
@@ -342,7 +514,7 @@ def test_crew_stage_failure_records_no_exception_text(
         run = AgentRun(session_id=session.session_id)
         db.add(run)
         db.commit()
-        with pytest.raises(RuntimeError, match="confidential provider details"):
+        with pytest.raises(error_type, match="confidential provider details"):
             crew.run_workflow("Esqueci minha senha", 0, db, run.agent_run_id)
         events = db.scalars(select(AgentEvent).order_by(AgentEvent.created_at)).all()
     engine.dispose()
