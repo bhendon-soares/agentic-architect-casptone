@@ -1,5 +1,15 @@
 # Especificacao funcional do frontend: chat de suporte (primeira etapa)
 
+## Diretriz visual da UI integrada
+
+Esta secao aplica-se ao chat integrado e ao Console Admin atuais; as secoes historicas abaixo descrevem a primeira etapa mockada e nao substituem os contratos de integracao vigentes.
+
+- Identidade escura e azulada: fundo `#0C1118`, superficies `#141C27`, bordas `#293548`, azul aco `#78A9E8` para foco, navegacao ativa e acoes primarias. Texto e metadados mantem contraste legivel; sucesso e erro preservam distincao textual e cromatica.
+- Cabecalho compacto e compartilhado; tipografia, espacamento e bordas discretas consistentes nas duas telas. Evitar gradientes, neon, icones decorativos, excesso de cards, badges e cantos muito arredondados.
+- Chat: abas de conversas com selecao perceptivel, status e horario legiveis, estado vazio enxuto, formulario em evidencia e botao **Executar** como acao primaria. Respostas, fontes, incidentes, erros e progresso continuam visiveis sem alterar seus estados.
+- Console Admin: metricas e listas densas e escaneaveis; conversas, tickets, fontes, detalhe, eventos e paginacao com hierarquia clara. Acoes e estados de carregamento/erro continuam acessiveis em desktop e mobile.
+- Aceite visual: sem sobreposicao ou overflow horizontal em 320 px, 390 px e desktop; campos com labels, foco visivel, texto legivel e controles utilizaveis por teclado. Nenhuma mudanca em APIs, handlers, regras de negocio, persistencia ou backend; suites frontend e build aprovados.
+
 ## Inputs
 
 - Entrada de demonstracao ficticia em pt-BR: "Esqueci a senha da minha conta corporativa de demonstração. Consigo acessar o método oficial de verificação de identidade."

@@ -1,5 +1,10 @@
 # Frontend Build: primeira etapa do chat de suporte
 
+## Revisao visual da UI integrada
+
+- Chat e Console Admin adotam uma identidade azul-grafite compartilhada em `src/frontend/style.css`, com cabecalho compacto, espacamento mais denso, metadados discretos e foco visivel. O chat destaca o formulario e a acao Executar; o console organiza metricas, listas e detalhes sem cards decorativos.
+- Contratos, estados, handlers, integracoes e backend permanecem inalterados. A diretriz e os criterios de aceite visuais foram registrados em `project-context/2.build/frontend-funcional-spec.md`; as notas da primeira etapa mockada abaixo permanecem como historico.
+
 ## Decisoes
 
 - A primeira etapa e uma unica rota React/TypeScript/Vite em pt-BR, tema escuro e visual minimo, com demonstracao local de `respond` para `password_reset`.

@@ -63,9 +63,11 @@ test('restarts in a new session and restores the old conversation from the serve
   expect(await screen.findByText('Atendimento: concluído')).toBeTruthy()
   fireEvent.click(screen.getByRole('button', { name: 'Reiniciar' }))
   expect(await screen.findByRole('button', { name: 'Conversa 2' })).toBeTruthy()
+  expect(screen.getByRole('button', { name: 'Conversa 2' }).getAttribute('aria-current')).toBe('page')
   expect(screen.queryByText('Redefinição de senha')).toBeNull()
   fireEvent.click(screen.getByRole('button', { name: 'Conversa 1' }))
   expect(await screen.findByText('Mensagem anterior')).toBeTruthy()
+  expect(screen.getByRole('button', { name: 'Conversa 1' }).getAttribute('aria-current')).toBe('page')
   expect(fetchMock).toHaveBeenLastCalledWith('/api/chat/sessions/session-1', undefined)
   expect(JSON.parse(localStorage.getItem('support-chat-sessions')!)).toEqual(['session-2', 'session-1'])
 })
@@ -107,7 +109,7 @@ test('admin console loads live metrics, tickets and sources and pages through ti
   const ticket = { ticket_id: 'ticket-1', session_id: 'session-1', agent_run_id: 'run-1', status: 'created', servicenow_number: 'INC-123', internal_category: 'password_reset', created_at: '2026-10-15T10:00:00Z' }
   const fetchMock = vi.fn((url: string) => {
     if (url === '/api/metrics/summary') return Promise.resolve(reply({ total_conversations: 4, tickets_created: 1, responses_with_source: 2, blocked_requests: 1 }))
-    if (url.includes('/api/admin/conversations?')) return Promise.resolve(reply({ items: [{ session_id: 'session-1', status: 'active', created_at: '2026-10-15T10:00:00Z', updated_at: '2026-10-15T10:00:00Z', last_activity_at: '2026-10-15T10:00:00Z', last_run: { final_action: 'respond', run_status: 'completed', error_code: null } }], total: 1 }))
+    if (url.includes('/api/admin/conversations?')) return Promise.resolve(reply({ items: [{ session_id: 'session-1', status: 'active', created_at: '2026-10-15T10:00:00Z', updated_at: '2026-10-15T10:00:00Z', last_activity_at: '2026-10-15T10:00:00Z', last_run: { final_action: 'respond', run_status: 'completed', error_code: null } }, { session_id: 'session-2', status: 'active', created_at: '2026-10-15T10:00:00Z', updated_at: '2026-10-15T10:00:00Z', last_activity_at: '2026-10-15T10:00:00Z', last_run: { final_action: 'blocked', run_status: 'completed', error_code: null } }], total: 2 }))
     if (url === '/api/knowledge/sources') return Promise.resolve(reply({ items: [{ title: 'Redefinição de senha', path: 'knowledge/password_reset.md', internal_category: 'password_reset', approved: true }] }))
     if (url.includes('offset=20')) return Promise.resolve(reply({ items: [], total: 21 }))
     if (url.includes('/api/tickets?')) return Promise.resolve(reply({ items: [ticket], total: 21 }))
@@ -117,7 +119,8 @@ test('admin console loads live metrics, tickets and sources and pages through ti
   render(<AdminConsole />)
 
   expect(await screen.findByText('INC-123')).toBeTruthy()
-  expect(within(screen.getByRole('region', { name: 'Conversas' })).getByText('Conversa session-')).toBeTruthy()
+  expect(within(screen.getByRole('region', { name: 'Conversas' })).getAllByText('Conversa session-')).toHaveLength(2)
+  expect(within(screen.getByRole('region', { name: 'Conversas' })).getByText('Bloqueado').classList.contains('blocked')).toBe(true)
   expect(within(screen.getByRole('region', { name: 'Métricas' })).getByText('4')).toBeTruthy()
   expect(screen.getByText('Redefinição de senha')).toBeTruthy()
   fireEvent.click(screen.getByRole('button', { name: 'Próxima' }))
@@ -181,6 +184,7 @@ test('admin console can inspect a failed ticket run without a completed turn', a
   vi.stubGlobal('fetch', fetchMock)
   render(<AdminConsole />)
   expect(await screen.findByText('ticket-2')).toBeTruthy()
+  expect(within(screen.getByRole('region', { name: 'Conversas' })).getByText('Falhou').classList.contains('failed')).toBe(true)
   fireEvent.click(within(screen.getByRole('region', { name: 'Conversas' })).getByRole('button', { name: 'Ver detalhes' }))
   expect(await screen.findByText('Ainda não há mensagens.')).toBeTruthy()
   fireEvent.click(within(screen.getByRole('region', { name: 'Conversa e decisões' })).getByRole('button', { name: 'Ver eventos' }))

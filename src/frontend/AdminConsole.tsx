@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import {
     getAdminConversation, getAdminConversations, getAgentRun, getKnowledgeSources, getMetrics, getTickets,
-    type AdminConversationDetail, type AdminConversationPage, type AgentRun, type KnowledgeSource, type Metrics, type RunError, type TicketPage,
+    type AdminConversation, type AdminConversationDetail, type AdminConversationPage, type AgentRun, type KnowledgeSource, type Metrics, type RunError, type TicketPage,
 } from './chatApi'
 import './style.css'
 
@@ -12,6 +12,14 @@ const actionLabels: Record<string, string> = {
 }
 const ticketStatusLabels: Record<string, string> = {
     pending: 'Pendente', created: 'Criado', failed: 'Falhou', outcome_unknown: 'Resultado incerto',
+}
+const conversationStatusLabels: Record<string, string> = {
+    active: 'Ativa', completed: 'Concluída', running: 'Em andamento', failed: 'Falhou', blocked: 'Bloqueado',
+}
+
+function conversationState(conversation: AdminConversation): { label: string; tone: string } {
+    const status = conversation.last_run?.run_status === 'failed' ? 'failed' : conversation.last_run?.final_action || conversation.last_run?.run_status || conversation.status
+    return { label: actionLabels[status] || conversationStatusLabels[status] || status, tone: status === 'failed' || status === 'blocked' ? status : '' }
 }
 
 function dateLabel(value: string | null): string {
@@ -138,10 +146,13 @@ export default function AdminConsole() {
                         <section className="admin-section admin-conversations" aria-labelledby="conversations-heading">
                             <div className="admin-section-heading"><h2 id="conversations-heading">Conversas</h2><span>{conversations ? `${conversations.total} no total` : '—'}</span></div>
                             {conversations?.items.length === 0 && <p className="admin-muted">Nenhuma conversa registrada.</p>}
-                            {conversations?.items.map((conversation) => <article className="admin-row" key={conversation.session_id}>
-                                <div><strong>Conversa {conversation.session_id.slice(0, 8)}</strong><span>{dateLabel(conversation.last_activity_at)} · {conversation.last_run ? (actionLabels[conversation.last_run.final_action || ''] || conversation.last_run.run_status) : conversation.status}{conversation.last_run?.error_code ? ` · ${conversation.last_run.error_code}` : ''}</span></div>
-                                <button type="button" className="admin-text-button" onClick={() => void openSession(conversation.session_id)}>Ver detalhes</button>
-                            </article>)}
+                            {conversations?.items.map((conversation) => {
+                                const state = conversationState(conversation)
+                                return <article className="admin-row" key={conversation.session_id}>
+                                    <div><strong>Conversa {conversation.session_id.slice(0, 8)}</strong><span className="admin-row-meta">{dateLabel(conversation.last_activity_at)} · <span className={`admin-state ${state.tone}`}>{state.label}</span>{conversation.last_run?.error_code ? ` · ${conversation.last_run.error_code}` : ''}</span></div>
+                                    <button type="button" className="admin-text-button" onClick={() => void openSession(conversation.session_id)}>Ver detalhes</button>
+                                </article>
+                            })}
                             {conversations && conversations.total > pageSize && <div className="admin-pagination">
                                 <button type="button" disabled={loading || conversationOffset === 0} onClick={() => void loadConversations(Math.max(0, conversationOffset - pageSize))}>Anterior</button>
                                 <span>{conversationOffset + 1}–{Math.min(conversationOffset + pageSize, conversations.total)} de {conversations.total}</span>
@@ -169,7 +180,7 @@ export default function AdminConsole() {
                             {sources?.length === 0 && <p className="admin-muted">Nenhuma fonte cadastrada.</p>}
                             {sources?.map((source) => <div className="admin-row" key={source.path}>
                                 <div><strong>{source.title}</strong><span>{source.path} · {source.internal_category}</span></div>
-                                <span className={`admin-state ${source.approved ? 'created' : 'failed'}`}>{source.approved ? 'Aprovada' : 'Pendente'}</span>
+                                <span className={`admin-state ${source.approved ? 'created' : ''}`}>{source.approved ? 'Aprovada' : 'Pendente'}</span>
                             </div>)}
                         </section>
                     </div>
@@ -180,12 +191,12 @@ export default function AdminConsole() {
                             <label htmlFor="session-id">ID da conversa</label>
                             <div><input id="session-id" value={sessionInput} onChange={(event) => setSessionInput(event.target.value)} placeholder="Cole o ID da conversa" /><button type="submit" disabled={!sessionInput.trim() || detailLoading}>Consultar</button></div>
                         </form>
-                        {!history && !run && !detailLoading && !detailError && <p className="admin-muted">Selecione uma conversa ou um ticket para ver o histórico.</p>}
+                        {!history && !run && !detailLoading && !detailError && <p className="admin-muted admin-detail-empty">Selecione uma conversa ou um ticket para ver o histórico.</p>}
                         {detailLoading && <p role="status" className="admin-muted">Carregando detalhes…</p>}
                         {detailError && <p role="alert" className="admin-error">{detailError}</p>}
                         {history && <div className="admin-history">
                             <p className="admin-id">Conversa {history.session_id}</p>
-                            <p className="admin-muted">{history.status} · Criada em {dateLabel(history.created_at)} · Atualizada em {dateLabel(history.updated_at)}</p>
+                            <p className="admin-muted">{conversationStatusLabels[history.status] || history.status} · Criada em {dateLabel(history.created_at)} · Atualizada em {dateLabel(history.updated_at)}</p>
                             {history.messages.length === 0 && <p className="admin-muted">Ainda não há mensagens.</p>}
                             {history.messages.map((message) => <div className="admin-message" key={message.message_id}>
                                 <span>{message.role === 'user' ? 'Solicitante' : 'Suporte'} · {dateLabel(message.created_at)}</span>
@@ -194,7 +205,7 @@ export default function AdminConsole() {
                             <h3>Decisões e execuções</h3>
                             {history.runs.length === 0 && <p className="admin-muted">Nenhuma execução registrada.</p>}
                             {history.runs.map((execution) => <div className="admin-turn" key={execution.agent_run_id}>
-                                <div><strong>{execution.final_action ? actionLabels[execution.final_action] : execution.status}</strong><span>{execution.summary || execution.error_code || execution.status} · {dateLabel(execution.started_at)}</span></div>
+                                <div><strong className={`admin-state ${execution.status === 'failed' ? 'failed' : execution.final_action === 'blocked' ? 'blocked' : ''}`}>{execution.status === 'failed' ? conversationStatusLabels.failed : execution.final_action ? actionLabels[execution.final_action] : conversationStatusLabels[execution.status] || execution.status}</strong><span>{execution.summary || execution.error_code || execution.status} · {dateLabel(execution.started_at)}</span></div>
                                 <button type="button" className="admin-text-button" onClick={() => void openRun(execution.agent_run_id)}>Ver eventos</button>
                                 {history.tickets.filter((ticket) => ticket.agent_run_id === execution.agent_run_id).map((ticket) => <p key={ticket.ticket_id}>Ticket: {ticket.servicenow_number || ticket.ticket_id} · {ticketStatusLabels[ticket.status] || ticket.status}{ticket.error_code ? ` · ${ticket.error_code}` : ''}</p>)}
                                 {execution.sources.map((source) => <p key={source.path}>Fonte: {source.title} · {source.path}</p>)}
