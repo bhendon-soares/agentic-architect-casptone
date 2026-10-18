@@ -260,7 +260,10 @@ def run_workflow(
         "QAPolicyAgent",
         "Revisar seguranca e evidencias",
         f"Relato redigido: {message}. Fonte: {sources}. "
-        f"Resposta: {draft.model_dump_json()}. Vete se insegura ou sem fonte.",
+        f"Resposta: {draft.model_dump_json()}. Vete instrucoes inseguras ou "
+        "procedimentos sem fonte. Abrir ticket ou pedir esclarecimento sem "
+        "fonte e permitido se a resposta nao inventar procedimentos e for segura. "
+        "Vete e bloqueie somente pedidos inseguros; aprove encaminhamento seguro.",
         PolicyDecision,
     )
     action = "blocked" if policy.veto_to_blocked else draft.candidate_action

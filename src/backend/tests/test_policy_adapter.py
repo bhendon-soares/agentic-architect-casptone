@@ -412,6 +412,8 @@ def test_low_confidence_decision(
         def kickoff(self):
             schema = self.task.output_pydantic
             sequence.append(schema.__name__)
+            if schema is crew.PolicyDecision:
+                assert "Abrir ticket ou pedir esclarecimento sem fonte e permitido" in self.task.description
             outputs = {
                 "TriageInput": {
                     "internal_category": "password_reset", "impact": 3,
