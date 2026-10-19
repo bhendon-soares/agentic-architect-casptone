@@ -65,6 +65,7 @@ O documento respeita o MRD/PRD como fonte de verdade, o runtime `crewai`, proces
 | ADR-007 | Backend chama adapter ServiceNow real ou mock/local somente apos persistir `final_action=open_ticket` | Agente prepara payload redigido sem acesso a ferramenta mutating; testes independem de ServiceNow externo | PRD FR-006 |
 | ADR-008 | Backend persiste `final_action` como autoridade final | `ResponseAgent` propoe `candidate_action`, `QAPolicyAgent` veta, backend valida e grava; `initial_action` de FR-002 e a sugestao inicial, nao uma segunda decisao persistida | PRD FR-002; PRD Decision Rules |
 | ADR-009 | Console admin aberto no P0 | Decisao fechada de produto; RBAC/auth ficam fora do MVP | PRD NFR Security & Compliance |
+| ADR-010 | Tabelas de telemetria P1 separadas de P0; "nao disponivel" normalizado para campos sem medicao confiavel | Aba IA como incremento P1 nao altera P0; medicao de tokens, tentativas e precos depende de confirmacao Azure Foundry; nao usar zero ficticio | PRD FR-009 Criteria de Aceite; PRD Future Features |
 
 ## 2. Multi-Agent System Specification
 
@@ -182,6 +183,38 @@ Na Build atual, o adapter OAuth e o commit anterior ao POST foram cobertos com H
 - Exibir justificativa curta da decisao final sem chain-of-thought.
 - Console admin sem login no P0, adequado a demo local/controlada.
 
+### P1: Aba IA - Consumo, Custo, Latência e Resultados (FR-009)
+
+A aba IA reutiliza o console admin existente e suas abas sem criar produto separado. Oferece:
+
+**Filtros e Navegação**:
+- Periodo temporal (data inicio/fim).
+- Modelo utilizado.
+- Etapa do workflow (triage, knowledge, response, policy, ticketing).
+- Resultado final (`respond`, `open_ticket`, `blocked`, `ask_clarification`, inconclusos).
+
+**Paineis Resumidos**:
+- Total de execucoes (`agent_run_id` unicos) no periodo.
+- Distribuicao de resultados com percentuais (apenas denominador: execucoes terminais nas tres classes principais).
+- Estados inconclusivos separados (em andamento, falha sem acao final, ask_clarification pendente).
+- Indicadores de custo estimado, duracao media e p95, moeda e tamanho da amostra.
+- Exibir **"nao disponivel"** quando ausencia de execucoes e ausencia de telemetria nao forem distinguiveis.
+
+**Graficos**:
+- Evolucao temporal de execucoes por resultado.
+- Distribuicao de estados (respond, open_ticket, blocked, inconclusos).
+- Distribuicao de latencia por etapa (media, p95, max).
+
+**Tabela de Detalhe por Etapa**:
+- `agent_run_id` (link para detalhe da conversa).
+- Etapa (triage, knowledge, response, policy, ticketing).
+- Modelo utilizado.
+- Inicio, fim, duracao (ms).
+- Tokens (entrada, saida, cache) com indicacao de **"nao disponivel"** se nao medido.
+- Custo estimado com moeda e vigencia de tarifa, ou **"nao disponivel"**.
+- Tentativas e falhas (tentativa real observada, retentativa operacional, replay idempotente).
+- Estado (completo, em andamento, falha).
+
 ## 4. Backend Architecture Specification
 
 ### API Architecture
@@ -197,6 +230,15 @@ Endpoints P0 recomendados:
 - `GET /api/metrics/summary`
 - `GET /api/knowledge/sources`
 - `GET /health`
+
+**P1: Endpoints de Observabilidade (FR-009)**:
+
+- `GET /api/ia-tab/summary`: agregacao por periodo, modelo, etapa, resultado (totais, distribuicao, media/p95 duracao, custo estimado total, moeda, tamanho amostra). Exibe "nao disponivel" para campos sem medicao ou tarifa nao cadastrada.
+- `GET /api/ia-tab/details`: tabela por `agent_run_id`, etapa com filtros (data inicio/fim, modelo, etapa, resultado); retorna lista paginada com campos: agent_run_id, step_name, modelo, start_time, end_time, duration_ms, tokens_input, tokens_output, tokens_cache, estimated_cost_value, estimated_cost_currency, estimated_cost_validity_start/end, attempt_count, retry_count, replay_count, state.
+- `GET /api/ia-tab/timeseries`: evolucao temporal de execucoes, distribuicao de resultados, latencia por etapa.
+- `GET /api/ia-tab/pricing-config`: tabela ativa de precos com campos modelo, deployment_id, moeda, tipo_token, tarifa_por_milhao, vigencia.
+
+Campos nao disponiveis retornam `null` com indicacao clara ao cliente para renderizacao "nao disponivel".
 
 Envelope HTTP recomendado:
 
@@ -223,6 +265,34 @@ Persistencia minima em PostgreSQL local:
 - `tickets`: ticket local, `servicenow_sys_id`, `servicenow_number`, categorias, impacto, urgencia, `resulting_priority`, status e payload redigido.
 - `app_logs`: logs estruturados redigidos quando nao forem armazenados apenas em arquivos/STDOUT.
 
+**P1: Tabelas de Observabilidade (FR-009)**:
+
+- `agent_run_telemetry`: chave unica `(agent_run_id, step_index)`, identificador de etapa (ex.: "intake_triage", "knowledge_search", "response_generation", "qa_policy", "ticketing"), modelo efetivamente utilizado, timestamps inicio/fim, estado (complete, running, failed), tokens entrada/saida/cache (NULL se nao medido), custo estimado em moeda (NULL se nao disponivel).
+- `agent_run_attempts`: rastreio de tentativas por etapa com contador de tentativa real observada (chamadas ao provider), retentativa operacional (re-execucao da etapa), replay idempotente (resposta cacheada), com timestamp e resultado (success, failure).
+- `pricing_config_versions`: tabela versionada de precos com campos modelo, deployment_id, moeda, tipo_token (entrada, saida, cache), tarifa_por_milhao, data_inicio, data_fim, ativo (boolean), criado em. Uma entrada ativa por modelo/deployment/tipo_token/moeda/periodo.
+- `agent_run_results_summary`: resultado final agregado por `agent_run_id` (respond, open_ticket, blocked, ask_clarification, failed, running) com timestamp persistencia.
+
+Nao ha tabelas P0 para tenants, roles, permissoes, OIDC identities ou perfis de prioridade.
+
+**Contrato de Medicao**:
+- Campos de token/custo exibem valor medido somente quando fornecido pelo CrewAI/provider com confiabilidade.
+- Presenca de campo em `CrewOutput` nao comprova medicao; normalizar documentando **"nao disponivel"** sem inferir zero.
+- Soma agregada de tokens por `agent_run_id` ocorre somente para campos medidos; indicar cobertura parcial.
+- Falha de `kickoff()` sem `CrewOutput` nao permite persistencia de consumo parcial; exibir **"nao disponivel"**.
+- Custo estimado calcula-se somente a partir de tokens medidos + tarifa vigente na data da execucao.
+- Tarifa sem preco valido, moeda compativel ou consumo suficiente resulta em **"nao disponivel"**, jamais zero ficticio.
+- Cache: quando tokens cache forem subconjunto de entrada, precificar entrada nao armazenada e cache separadamente. Se a relacao nao puder confirmarse, custo fica indisponivel.
+- A aba IA exibe e agrega custos somente em USD; tarifas em outras moedas nao sao aceitas para calculo e nao ha conversao cambial em P1.
+
+**Contrato de Resultados**:
+- `respond`: resolvido no chat sem ticket.
+- `open_ticket`: escalonado para ServiceNow.
+- `blocked`: bloqueado pre-crew (pedido inseguro) ou pos-policy (acao rejeitada).
+- `ask_clarification`: aguardando pergunta do usuario.
+- `failed`: execucao com erro sem acao final definida.
+- `running`: execucao em andamento.
+- Replays nao entram no denominador de percentuais.
+
 Nao ha tabelas P0 para tenants, roles, permissoes, OIDC identities ou perfis de prioridade.
 
 ### Runtime Integration Layer
@@ -232,6 +302,21 @@ Nao ha tabelas P0 para tenants, roles, permissoes, OIDC identities ou perfis de 
 - O backend calcula e persiste `final_action`; agentes nao gravam diretamente no banco.
 - Somente o backend chama o adapter ServiceNow apos confirmar `final_action=open_ticket` persistida e validar o payload redigido preparado pelo agente de ticketing.
 - Prompt/runtime trace na Build deve redigir secrets e pode registrar hashes/templates em vez de texto sensivel.
+
+**P1: Captura de Telemetria (FR-009)**:
+
+- Apos cada etapa da crew (IntakeTriageAgent, KnowledgeAgent, ResponseAgent, QAPolicyAgent, TicketingEscalationAgent), persistir em `agent_run_telemetry` os campos:
+  - `agent_run_id`, `step_index`, `step_name`.
+  - `model_used`: modelo reportado pela etapa ou `CrewOutput`.
+  - `timestamp_start`, `timestamp_end` (ISO 8601 UTC).
+  - `state`: 'complete', 'running', 'failed'.
+  - `tokens_input`, `tokens_output`, `tokens_cache` (NULL se nao fornecido pelo provider).
+  - `estimated_cost_value` (calculado apenas se tokens + tarifa vigente disponivel), `estimated_cost_currency`, `pricing_config_id` (referencia da linha ativa de preco).
+- Se `kickoff()` falha, `CrewOutput` nao e persistido; etapas completadas ate falha podem ter telemetria, etapas nao alcancadas resultam em "nao disponivel".
+- Instrumentar cada chamada de `stage()` no backend: registrar inicio UTC e `time.perf_counter()` antes de `kickoff()`, e fim UTC e diferenca monotonicamente medida em milissegundos no caminho de sucesso ou falha. A duracao inclui `kickoff()` e validacao da etapa, nao representa somente latencia do provider. Eventos `TaskStartedEvent`, `TaskCompletedEvent` e `TaskFailedEvent` podem auxiliar no diagnostico, mas nao substituem a medicao da etapa (inclusive falhas antes da task).
+- Eventos `LLMCallStartedEvent`, `LLMCallCompletedEvent` e `LLMCallFailedEvent` permitem observar chamadas logicas do CrewAI por `task_id`/`agent_role` e `call_id`, sem persistir mensagens ou respostas. Inicio pode ocorrer antes de hooks e do envio ao provider; retries do adapter/SDK podem ocorrer sem novo evento. Registrar tentativas reais em `agent_run_attempts` somente com instrumentacao validada no limite do transporte/provider que observe cada envio; caso contrario, exibir "nao disponivel" para esse contador. `successful_requests` nao e proxy de tentativas reais.
+- Replays idempotentes (respostas cacheadas/reutilizadas) sao registrados em `agent_run_attempts` com `attempt_type='replay'`, nao incrementando tokens, custo nem falhas de etapa.
+- Privacidade: nenhum dado de telemetria armazena prompts, respostas brutas, secrets ou PII; segue a redacao existente de eventos.
 
 ### ServiceNow Ticketing Integration Contract
 
@@ -399,6 +484,63 @@ sequenceDiagram
 - Registrar modelo, tokens/custo estimado quando disponivel.
 - `max_rpm`, temperature e max tokens devem ser configuraveis.
 
+### P1: Latência, Preços e Contadores de Tentativas (FR-009)
+
+**Latência por Etapa**:
+- Medir no wrapper `stage()` do backend, do inicio de `kickoff()` ate a validacao ou excecao, inclusive em falha, usando `time.perf_counter()` para duracao em milissegundos e timestamps UTC para exibicao. Nao subtrair timestamps de eventos CrewAI nem confundir latencia da etapa com tempo de rede do provider.
+- Apresentar em agregacao:
+  - **Media**: sum(duracao) / count.
+  - **p95 (Nearest Rank)**: valor no percentil 95 de amostras ordenadas.
+  - **Max**: maior duracao observada.
+- Agregar duracoes medidas por etapa e por execucao; replays idempotentes nao executam etapas e nao entram nas amostras de latencia de etapas.
+- Latencia total de `agent_run_id`: soma de todas as etapas + overhead de orquestracao.
+- Execucoes em andamento aparecem separadamente, sem duracao final ficticia.
+- Quando amostra < 10 execucoes, indicar tamanho da amostra; p95 e media podem ser identicos.
+
+**Tabela de Precos Versionada**:
+
+| Modelo | Deployment | Moeda | Tipo Token | Tarifa (por 1M) | Vigencia Inicio | Vigencia Fim | Ativo |
+| :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
+| `gpt-6-sol` | `azure/gpt-6-sol` (a confirmar) | USD | entrada | $2.00 | TBD | TBD | false |
+| `gpt-6-sol` | `azure/gpt-6-sol` (a confirmar) | USD | entrada_cache | $0.20 | TBD | TBD | false |
+| `gpt-6-sol` | `azure/gpt-6-sol` (a confirmar) | USD | escrita_cache | $2.50 | TBD | TBD | false |
+| `gpt-6-sol` | `azure/gpt-6-sol` (a confirmar) | USD | saida | $10.00 | TBD | TBD | false |
+
+**Calculo de Custo Estimado**:
+- Custo = (tokens_entrada * tarifa_entrada + tokens_cache * tarifa_cache + tokens_saida * tarifa_saida) / 1.000.000.
+- Se tokens_cache sao subconjunto de tokens_entrada, custo_entrada_nao_armazenada = (tokens_entrada - tokens_cache) * tarifa_entrada + tokens_cache * tarifa_cache.
+- Sem relacao confirmada, o custo fica **"nao disponivel"**.
+- Aplicar tarifa vigente na data da execucao; preservar versao do preco em `pricing_config_id` para auditoria.
+- Resultado final identificado como **"estimativa"**.
+- **Jamais exibir custo zero ficticio**. Sem tarifa valida, moeda compativel ou consumo suficiente, mostrar **"nao disponivel"**.
+
+**Dependencias para Habilitar Estimativas**:
+- Confirmar no Azure Foundry: SKU exato de `azure/gpt-6-sol`, tipo e regiao do deployment, faixa de contexto, preco contratado e inicio/fim de vigencia.
+- Cadastrar tarifa aplicavel em `pricing_config_versions` com flags de ativo=true e vigencia apropriada.
+- Dispor de consumo de tokens confiavel do provider para 20+ execucoes.
+- **Sem confirmacao e cadastro, exibir "nao disponivel"**, nao presumir equivalencia automatica com tarifa publica.
+
+**Referencia Publica (Planejamento Apenas, Nao Tarifa Aplicavel)**:
+- Fonte: Microsoft Azure OpenAI pricing (2026-01-XX).
+- Modelo GPT-6 Sol, Global Standard, contexto curto.
+- Hipotese: 1.000 tokens entrada + 500 tokens saida por etapa, sem cache.
+- Custo por etapa: (1.000 / 1.000.000 * $2.00) + (500 / 1.000.000 * $10.00) = $0.007.
+- Se 5 etapas por execucao com consumo identico: $0.035/execucao, $35/1.000 execucoes.
+- Sao premissas de volume e tarifa publica, nao medicoes de uso nem previsao de fatura.
+
+**Contadores de Tentativas e Replays**:
+- **Tentativa real**: envio observado ao LLM provider no limite do transporte, incluindo retries internos apenas quando instrumentados; eventos de chamada logica do CrewAI e `successful_requests` nao sao proxy.
+- **Retentativa operacional**: nova execucao da etapa com referencia a original (e uma execucao propria persistida).
+- **Replay idempotente**: reutilizacao de resposta persistida; nao incrementa execucoes, tokens, custo nem falhas.
+- **Falha de etapa**: erro sem resposta final nessa etapa.
+- Contar separadamente, sem inferir uma tentativa a partir de `kickoff()` bem-sucedido.
+- Exibir quatro contadores com definicoes no painel.
+
+**Migracao de Dados Historicos**:
+- Registros anteriores ao incremento P1 permanecen visiveis com metricas ausentes como **"nao disponivel"**.
+- Nao reprocessar ou fazer backfill de consumo inferido.
+- Timestamp de primeira telemetria persistida marca inicio de cobertura para cada execucao.
+
 ## 8. Security & Compliance Architecture
 
 ### AuthN/AuthZ
@@ -451,6 +593,7 @@ sequenceDiagram
 | FR-006 ServiceNow Ticketing | Adapter real/mock e contrato Table API | Covered |
 | FR-007 Basic Admin Console | Tickets, conversa, eventos, fontes, metricas | Covered |
 | FR-008 QA And Basic Observability | Unit tests, integration test, logs/eventos | Covered |
+| FR-009 Aba IA (P1) | Tabelas de telemetria, APIs, filtros, paineis, precos, latencia, tentativas | Covered (P1 increment) |
 
 ### Evaluation Criteria
 
@@ -463,6 +606,9 @@ O MVP nao exige LLM-as-judge nem evals sofisticados. A fase Build deve validar o
 | EC-003 | Ticketing | Payload ServiceNow contem campos obrigatorios e nao exige `priority` | 100% dos casos de ticket | Contract test | PRD ServiceNow Ticketing Contract |
 | EC-004 | Workflow | Integration test `chat -> agents -> ticket` | Passa com mock/local | Integration test | PRD FR-008 |
 | EC-005 | UX | Resposta com fonte mostra titulo/caminho/trecho | 100% quando fonte usada | UI/API assertion | PRD FR-003/FR-007 |
+| EC-006 | Telemetry (P1) | Tabela de precos cadastrada com tarifa ativa; 20+ execucoes com tokens confiavel | Nao aplicavel se confirmacao Azure Foundry pendente | Data validation + pricing config check | PRD FR-009 |
+| EC-007 | Latency (P1) | Media e p95 de duracao de etapas; replays nao incrementam contadores | 100% dos registros com latencia medida | Query assertion | PRD FR-009 |
+| EC-008 | Privacy (P1) | Zero secrets/PII em telemetria; migracao de dados com "nao disponivel" | 0 ocorrencias de PII em agent_run_telemetry | Log/DB scan | PRD FR-009 |
 
 ## 10. MVP Launch & Feedback Strategy
 
@@ -516,6 +662,8 @@ O arquivo `project-context/1.define/sfs/multi-agent-support-flow.md` foi mantido
 - `project-context/1.define/prd.md`
 - `project-context/1.define/sad.md` anterior, revisado e substituido
 - `project-context/1.define/sfs/multi-agent-support-flow.md` anterior, revisado e substituido
+- `src/backend/app/runtime/crew.py` (uma `Crew.kickoff()` por etapa e tratamento de falhas)
+- CrewAI instalado: `events/types/llm_events.py`, `events/types/task_events.py`, `llms/providers/openai/completion.py` e `task.py` (eventos, hooks e retries)
 - Solicitacao do operador em 2026-09-26 com decisoes fechadas do MVP Slim
 - Plano aprovado pelo operador em 2026-10-05: sete fontes ficticias aprovadas somente para demo, `unknown` limitado a coleta/escalonamento e primeiro fluxo `password_reset`.
 
@@ -527,19 +675,38 @@ O arquivo `project-context/1.define/sfs/multi-agent-support-flow.md` foi mantido
 - Console admin aberto e aceitavel apenas para ambiente local/demo single-tenant.
 - A SFS permanece necessaria apenas como especificacao funcional curta do fluxo integrado P0; demais detalhes ficam no PRD/SAD para evitar duplicacao.
 
+**P1: Assumptions sobre Telemetria e Precos (FR-009)**:
+- CrewAI fornece `CrewOutput` com agregacoes de tokens por etapa quando `kickoff()` bem-sucedido; nao presume zero para campos ausentes.
+- Adapter `azure/gpt-6-sol` e configurado conforme ambiente; SKU, deployment, regiao e tarifa sao pendentes de confirmacao com Azure Foundry.
+- Tarifa publica de $2.00/$10.00/etc. nao presume equivalencia com preco contratado; necessaria confirmacao explicita.
+- CrewAI fornece eventos de chamadas logicas e tasks, mas nao contador confiavel de envios reais ao provider incluindo retries internos; estes exigem instrumentacao de transporte validada.
+- Duracao por etapa e medida no backend com relogio monotonicamente crescente, inclusive em falha; a aba IA opera somente em USD, sem conversao cambial.
+- Replays idempotentes sao distinguiveis por estado de cache/persistencia; nao inferir replay a partir de `kickoff()` bem-sucedido.
+- Migracao de dados historicos (anterior ao incremento P1) preserva registros com metricas como "nao disponivel", sem backfill.
+
 ## Open Questions
 
-- Nenhuma em aberto para o dataset P0.
+- **Azure Foundry SKU e Tarifa (Bloqueante para FR-009 Pricing)**: Qual e o SKU exato de `azure/gpt-6-sol`, tipo de deployment (por exemplo, Global Standard), regiao, faixa de contexto, preco contratado USD por 1M tokens (entrada, saida, cache quando aplicavel) e datas de vigencia? Sem confirmacao e cadastro em `pricing_config_versions`, a aba IA exibira "nao disponivel" para custo estimado.
 
 ## Audit
 
-- Data/hora: 2026-09-26T02:23:54-03:00
+- Data: 2026-10-19; decisao do operador: aba IA somente em USD. Pesquisa no runtime local: eventos CrewAI observam chamadas logicas e tasks, nao garantem cada envio/retry do SDK; medir duracao da etapa no backend com `time.perf_counter()` inclusive em falha. Fechadas as tres questoes de tentativas, latencia e conversao; SKU/tarifa Azure permanece pendente. Validacao: `git diff --check`.
+- Data/hora: 2026-10-19T20:36:43-03:00
 - Persona id: `system-arch`
-- Acao executada: `update-sad`
+- Acao executada: `update-sad-with-fr-009`
+- Traceabilidade: PRD FR-009 (linhas 188-226 de prd.md) com criterios de aceite, dependencias, precos e privacidade.
 - Runtime resolvido: `crewai`
 - AAMAD_TARGET_RUNTIME: `crewai` (resolvido de `aamad.config.yml`)
-- Ferramentas/arquivos lidos: `AGENTS.md`; `.github/instructions/aamad-core.instructions.md`; `.github/instructions/adapter-crewai.instructions.md`; `aamad.config.yml`; `project-context/1.define/mrd.md`; `project-context/1.define/prd.md`; SAD anterior; `project-context/1.define/sfs/multi-agent-support-flow.md`; comando local `date -Iseconds` para timestamp.
-- Decisao sobre SFS: manter e substituir `project-context/1.define/sfs/multi-agent-support-flow.md` por uma SFS menor, estritamente P0, porque ela orienta a implementacao/teste do fluxo integrado e remove conteudo obsoleto de escopo antigo.
-- Prompt Trace: omitido porque este e um artefato de arquitetura da fase Define; as fontes materiais e decisoes fechadas estao registradas em `Sources`, `Assumptions` e `Audit`.
-- Revisao em 2026-10-05: contratos de fonte, prioridade, bloqueio pre-crew, schemas CrewAI e autoridade do backend sobre o POST alinhados ao plano aprovado pelo operador; validacao executada com `.venv/bin/aamad validate --phase define`.
-- Decisao do operador em 2026-10-05: autenticacao ServiceNow via OAuth; credenciais reais ficam fora dos artefatos.
+- Secoes atualizadas:
+  - 3. Frontend: adicionada subsecao "P1: Aba IA" com descricao de filtros, paineis, graficos e tabela de detalhe por etapa.
+  - 4. Backend: expandido "Data Architecture" com tabelas `agent_run_telemetry`, `agent_run_attempts`, `pricing_config_versions`, `agent_run_results_summary` e contrato de medicao; expandido "API Architecture" com endpoints P1 de observabilidade; expandido "Runtime Integration Layer" com captura de telemetria, privacidade e tratamento de falhas.
+  - 7. Performance: adicionada subsecao "P1: Latencia, Precos e Contadores" com especificacoes de duracao, tabela de precos versionada, calculo de custo (com hipotese publica mas nao confirmada para gpt-6-sol), dependencias de confirmacao Azure Foundry, contadores de tentativa/retry/replay.
+  - 9. Testing: atualizada tabela "PRD Coverage Review" com FR-009; adicionados criterios de avaliacao EC-006 (telemetry), EC-007 (latency), EC-008 (privacy).
+  - Assumptions: adicionadas premissas P1 sobre CrewAI, SKU pendente, tarifa publica nao presume contrato, callbacks de tentativas, migracao de dados historicos.
+  - Open Questions: adicionadas tres questoes bloqueantes e pendentes de confirmacao operador sobre Azure Foundry SKU/tarifa, telemetria de tentativas CrewAI e conversao de moedas.
+- Ferramentas/arquivos lidos: `prd.md` (linhas 180-226); `sad.md` anterior completo; `.github/agents/system-arch.agent.md`.
+- Prompt Trace: omitido porque artefato de arquitetura da fase Define; fontes, decisoes e rastreabilidade sao registradas em Sources, Assumptions, Open Questions e Audit.
+- Preservacao de P0: escopo P0 intacto (chat, triage, knowledge, response, policy, ticketing, console admin basico); P1 adicionado como incremento sem alterar P0 ou contratos existentes.
+- Preservacao de "nao disponivel": campo normalizado preservado em telemetria quando medicao nao disponivel (ausencia de CrewOutput apos falha, tokens nao fornecidos pelo provider, tarifa nao cadastrada, cache nao distinguivel de entrada).
+- Data/hora resolucao runtime: registrada em Audit.
+- Revisao final: alinhamento com aamad-core.instructions.md (context-first, reproducibility, minimal viable, deterministic) e adapter-crewai.instructions.md (external YAML, sequential process, output_pydantic, task guardrails).
