@@ -1,8 +1,25 @@
-# Especificacao funcional do frontend: chat de suporte (primeira etapa)
+# Especificacao funcional do frontend: chat e console integrados
+
+## UI integrada - contrato atual (A)
+
+- Tema Sistema/Claro/Escuro com preferencia local e aplicacao antes da renderizacao; tokens de cor, estados, datas de Sao Paulo, duracoes, IDs copiaveis e avisos compartilhados entre chat e console.
+- Chat: envio e nova conversa; historico carregado pela API, titulo da primeira mensagem quando disponivel, resposta em Markdown limitado, fonte apenas pelo titulo (sem caminho/trecho ou resumo interno). Mostrar cada `final_action` como resultado distinto: resposta concluida, esclarecimento aguardando usuario, bloqueio de politica ou ticket aberto somente com status `created` e numero. Falha tecnica e resultado incerto nao sao conclusao. Preservar a chave de idempotencia no retry da aba e exigir verificacao apos recarga antes de novo incidente.
+- Console: Visao geral, Conversas, Tickets, Conhecimento e IA. KPIs apenas do servidor; listas paginadas nao representam o total global. Detalhe e eventos redigidos; desfecho na timeline apenas se `final_action` constar no payload de `decision`. Payloads ficam recolhidos. Prioridade ausente e data ausente sao indicadas como indisponiveis, nao inferidas.
+- IA: filtros e amostras da API, `null` diferente de zero. Custo estimado apenas quando entregue pelo servidor; tarifas de referencia recolhidas, sem exemplos calculados. p95 e maximo ocultos em amostras de menos de 20 etapas; media permanece exibida. Tabela por etapa paginada com aviso de pagina parcial.
+- Aceite: testes de resultados, retry FR-007, eventos, tema e amostra pequena; typecheck e build. Verificacao visual em 320, 390 e 1280 px, sem overflow da pagina; tabela IA com scroll proprio. Contraste medido nas superficies principais: texto 18,27:1 (claro) e 14,64:1 (escuro); texto secundario 6,71:1 e 6,94:1; botao primario 6,29:1 e 9,52:1. Ver `frontend.md` para limites da verificacao.
+
+## Propostas dependentes de backend (B; nao implementadas)
+
+- Se o produto precisar de estado definitivo de ticket apos recarga ou entre dispositivos, contratar endpoint de reconciliacao por `session_id`/`agent_run_id` com resultado autoritativo e codigo de erro; nunca criar um segundo incidente para descobrir o estado.
+- Para metricas globais de custo e latencia com cobertura mensuravel, backend deve fornecer periodo, total de execucoes, tamanho de cada amostra, denominadores e politica de telemetria incompleta. A UI nao agregara paginas de detalhes nem inferira duracao a partir de datas.
+- Para visualizacao de decisao em todas as etapas, backend deve entregar eventos redigidos e semantica documentada de `task_id`, `final_action` e status. Ausencia do evento e desconhecida, nao uma decisao presumida.
+- Confirmar categorias e prioridades por campos tipados/rotulos de API para eliminar exibicao de codigos desconhecidos; nao manter tabela frontend como autoridade do dominio.
+
+## Historico: primeira etapa mockada (nao vigente)
 
 ## Diretriz visual da UI integrada
 
-Esta secao aplica-se ao chat integrado e ao Console Admin atuais; as secoes historicas abaixo descrevem a primeira etapa mockada e nao substituem os contratos de integracao vigentes.
+Esta secao registra a diretriz da primeira etapa; as secoes historicas abaixo nao substituem os contratos da UI integrada acima.
 
 - Identidade escura e azulada: fundo `#0C1118`, superficies `#141C27`, bordas `#293548`, azul aco `#78A9E8` para foco, navegacao ativa e acoes primarias. Texto e metadados mantem contraste legivel; sucesso e erro preservam distincao textual e cromatica.
 - Cabecalho compacto e compartilhado; tipografia, espacamento e bordas discretas consistentes nas duas telas. Evitar gradientes, neon, icones decorativos, excesso de cards, badges e cantos muito arredondados.

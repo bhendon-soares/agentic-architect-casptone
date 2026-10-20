@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 import yaml
 from crewai import LLM, Agent, Crew, Process, Task
+from crewai.types.usage_metrics import UsageMetrics
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -174,6 +175,7 @@ def run_workflow(
             agent_run_id=agent_run_id,
             step_index=list(stages).index(role),
             step_name=name,
+            model_used=model,
             timestamp_start=datetime.now(timezone.utc),
             state="running",
         )
@@ -188,6 +190,19 @@ def run_workflow(
                 memory=MEMORY_ENABLED,
                 verbose=False,
             ).kickoff()
+            usage = getattr(result, "token_usage", None)
+            if (
+                isinstance(usage, UsageMetrics)
+                and usage.successful_requests > 0
+                and usage.prompt_tokens >= 0
+                and usage.completion_tokens >= 0
+                and usage.prompt_tokens + usage.completion_tokens > 0
+            ):
+                telemetry.tokens_input = usage.prompt_tokens
+                telemetry.tokens_output = usage.completion_tokens
+                if 0 < usage.cached_prompt_tokens <= usage.prompt_tokens:
+                    telemetry.tokens_cache = usage.cached_prompt_tokens
+                    telemetry.cache_in_input = True
             if result.pydantic is None:
                 raise InvalidAgentOutput("Invalid structured output")
             validated = schema.model_validate(result.pydantic.model_dump())
@@ -249,8 +264,12 @@ def run_workflow(
         "KnowledgeAgent",
         "Selecionar somente evidencia local aplicavel",
         f"Relato redigido: {message}. Fontes elegiveis: {sources}. "
-        "Retorne selected_paths apenas para fonte operacional realmente aplicavel. "
-        "Se nenhuma fonte se aplica, retorne lista vazia.",
+        "Selecione fontes com ao menos uma orientacao operacional aplicavel ao relato, "
+        "mesmo que outras orientacoes sejam especificas a um subtipo nao confirmado. "
+        "Para impressoras, energia e conexao visivel aplicam-se mesmo sem confirmar "
+        "se o equipamento usa etiquetas; nao presuma que usa etiquetas. "
+        "Retorne apenas os paths dessas fontes em selected_paths. "
+        "Se nenhuma orientacao se aplica, retorne lista vazia.",
         EvidenceSet,
     )
     eligible = {source["path"] for source in sources}
@@ -270,9 +289,11 @@ def run_workflow(
         "Se ja houve esclarecimento, o relato inclui a pergunta anterior e a "
         "resposta do usuario; nao use ask_clarification novamente. "
         "candidate_action deve ser exatamente respond, ask_clarification, "
-        "open_ticket ou blocked. Use respond apenas quando a fonte sustentar "
-        "a instrucao; "
-        "se nao, pergunte uma vez ou proponha ticket. Nao invente procedimentos.",
+        "open_ticket ou blocked. Use respond apenas com orientacoes sustentadas "
+        "pela fonte e aplicaveis ao relato; nao presuma detalhes do equipamento. "
+        "Se houver passos iniciais seguros na fonte, oriente-os antes de solicitar "
+        "detalhes adicionais. Se nao houver, pergunte uma vez ou proponha ticket. "
+        "Nao invente procedimentos.",
         ResponseDraft,
     )
     policy = stage(

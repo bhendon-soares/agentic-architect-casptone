@@ -464,6 +464,7 @@ def test_response_replay_and_clarification(
         headers={"Idempotency-Key": "first"},
     )
     assert first.json()["data"]["final_action"] == "ask_clarification"
+    before_replay = client.get("/api/ia-tab/summary").json()["data"]
     assert (
         client.post(
             url,
@@ -472,6 +473,8 @@ def test_response_replay_and_clarification(
         ).json()["data"]
         == first.json()["data"]
     )
+    after_replay = client.get("/api/ia-tab/summary").json()["data"]
+    assert after_replay == {**before_replay, "replays": before_replay["replays"] + 1}
     assert (
         client.post(
             url,
@@ -614,7 +617,19 @@ def test_ia_summary_details_filters_and_missing_data(client: TestClient) -> None
         ]
         == 100
     )
-    assert client.get("/api/ia-tab/pricing-config").json()["data"]["items"] == []
+    prices = client.get("/api/ia-tab/pricing-config").json()["data"]
+    assert prices["items"] == []
+    reference_prices = prices["reference_prices"]
+    assert {row["token_type"]: row["rate_per_million"] for row in reference_prices} == {
+        "input": 2.0,
+        "cache": 0.2,
+        "cache_write": 2.5,
+        "output": 10.0,
+    }
+    assert all(
+        row["active"] is False and row["valid_from"] is None
+        for row in reference_prices
+    )
 
 
 def test_ia_cost_needs_exact_valid_usd_rates_and_known_cache(
@@ -701,6 +716,119 @@ def test_ia_cost_needs_exact_valid_usd_rates_and_known_cache(
     db.commit()
     assert client.get(path).json()["data"]["items"][0]["estimated_cost_value"] is None
     db.close()
+
+def test_ia_http_round_trip_with_partial_and_missing_measurements(
+    client: TestClient,
+) -> None:
+    db = next(app.dependency_overrides[get_session]())
+    when = datetime(2026, 10, 15, 12, tzinfo=timezone.utc)
+    session = ChatSession()
+    db.add(session)
+    db.flush()
+    db.add(ChatMessage(
+        session_id=session.session_id, role="user",
+        message_pt_br="senha=private-sentinel",
+    ))
+    runs = {}
+    for index, (name, status, action) in enumerate((
+        ("complete", "completed", "respond"),
+        ("failed", "failed", None),
+        ("running", "running", None),
+        ("blocked", "completed", "blocked"),
+        ("historical", "completed", "open_ticket"),
+    )):
+        run = AgentRun(
+            session_id=session.session_id, status=status, final_action=action,
+            started_at=when + timedelta(minutes=index),
+        )
+        db.add(run)
+        db.flush()
+        runs[name] = run
+    for run_name, index, step, state, duration in (
+        ("complete", 0, "triage", "complete", 10),
+        ("complete", 1, "knowledge", "complete", 20),
+        ("failed", 0, "triage", "failed", 90),
+        ("running", 0, "triage", "running", None),
+    ):
+        db.add(AgentRunTelemetry(
+            agent_run_id=runs[run_name].agent_run_id, step_index=index,
+            step_name=step, state=state, timestamp_start=when,
+            timestamp_end=(
+                when + timedelta(milliseconds=duration)
+                if duration is not None else None
+            ),
+            duration_ms=duration,
+            model_used="measured-model" if run_name == "complete" else None,
+            tokens_input=100 if run_name == "complete" else None,
+            tokens_output=None, tokens_cache=None,
+        ))
+    for attempt_type in ("operational_retry", "replay"):
+        db.add(AgentRunAttempt(
+            agent_run_id=runs["failed"].agent_run_id,
+            attempt_type=attempt_type, outcome="recorded",
+        ))
+    db.commit()
+    run_ids = {name: run.agent_run_id for name, run in runs.items()}
+    session_id = session.session_id
+    db.close()
+
+    summary_response = client.get("/api/ia-tab/summary")
+    assert summary_response.status_code == 200
+    summary = summary_response.json()["data"]
+    assert summary["total_runs"] == 5
+    assert summary["telemetry_rows"] == 4
+    assert summary["available_models"] == ["measured-model"]
+    assert summary["duration"]["sample_size"] == 3
+    assert summary["duration"]["p95_ms"] == 90
+    assert summary["terminal_denominator"] == 3
+    assert summary["step_failures"] == 1
+    assert summary["observed_model_attempts"] is None
+    assert summary["operational_retries"] == summary["replays"] == 1
+    assert summary["estimated_cost_value"] is None
+    assert summary["cost_sample_size"] == 0
+
+    page = client.get("/api/ia-tab/details?limit=2&offset=0").json()
+    assert page["data"]["total"] == 6
+    assert len(page["data"]["items"]) == 2
+    items = client.get("/api/ia-tab/details?limit=100").json()["data"]["items"]
+    assert {item["agent_run_id"] for item in items if item["step_name"] is None} == {
+        run_ids["blocked"], run_ids["historical"],
+    }
+    partial = next(
+        item for item in items if item["agent_run_id"] == run_ids["complete"]
+    )
+    assert partial["tokens_input"] == 100
+    assert partial["tokens_output"] is None
+    assert partial["estimated_cost_value"] is None
+    assert partial["attempt_count"] is None
+    assert client.get(f"/api/admin/conversations/{session_id}").status_code == 200
+    assert client.get(f"/api/agent-runs/{run_ids['failed']}").status_code == 200
+
+    criteria = (
+        "start=2026-10-15T12:00:00Z&end=2026-10-16T00:00:00Z"
+        "&step=triage&result=failed"
+    )
+    filtered = client.get(f"/api/ia-tab/summary?{criteria}").json()["data"]
+    assert filtered["total_runs"] == 1
+    assert client.get(f"/api/ia-tab/details?{criteria}").json()["data"]["total"] == 1
+    model_filter = "model=measured-model&step=knowledge&result=respond"
+    model_summary = client.get(f"/api/ia-tab/summary?{model_filter}").json()["data"]
+    assert model_summary["total_runs"] == 1
+    blocked = client.get("/api/ia-tab/summary?result=blocked").json()["data"]
+    running = client.get("/api/ia-tab/summary?result=running").json()["data"]
+    assert blocked["telemetry_rows"] == 0
+    assert running["duration"]["sample_size"] == 0
+    series = client.get("/api/ia-tab/timeseries").json()["data"]
+    assert series["stage_latency"]["triage"]["p95_ms"] == 90
+    assert series["states"]["blocked"] == 1
+    assert client.get("/api/ia-tab/pricing-config").json()["data"]["items"] == []
+    for path in ("summary", "details", "timeseries", "pricing-config"):
+        payload = json.dumps(client.get(f"/api/ia-tab/{path}").json())
+        assert "private-sentinel" not in payload
+        assert not any(key in payload for key in (
+            '"message_pt_br"', '"prompt"', '"response_data"', '"api_key"',
+        ))
+
 
 
 def test_ia_operational_retry_not_provider_attempt(

@@ -27,6 +27,12 @@ RESULTS = (
     "running",
 )
 STEPS = ("triage", "knowledge", "response", "policy", "ticketing")
+REFERENCE_RATES = (
+    ("input", 2.00),
+    ("cache", 0.20),
+    ("cache_write", 2.50),
+    ("output", 10.00),
+)
 
 
 def iso(value: datetime | None) -> str | None:
@@ -278,10 +284,40 @@ def summary(
         and len(costs) == len(stage_items)
         and len({item["agent_run_id"] for item in stage_items}) == len(runs)
     )
+    selected_steps = {
+        (item["agent_run_id"], item["step_index"]) for item in stage_items
+    }
+    attempts = (
+        db.scalars(
+            select(AgentRunAttempt).where(
+                AgentRunAttempt.agent_run_id.in_([run.agent_run_id for run in runs])
+            )
+        ).all()
+        if runs
+        else []
+    )
+    attempt_counts = Counter(
+        attempt.attempt_type
+        for attempt in attempts
+        if not criteria["step"] and not criteria["model"]
+        or attempt.step_index is None
+        or (attempt.agent_run_id, attempt.step_index) in selected_steps
+    )
+    available_models = db.scalars(
+        select(AgentRunTelemetry.model_used)
+        .where(AgentRunTelemetry.model_used.is_not(None))
+        .distinct()
+        .order_by(AgentRunTelemetry.model_used)
+    ).all()
     return envelope(
         {
             "total_runs": len(runs),
             "telemetry_rows": len(stage_items),
+            "available_models": available_models,
+            "step_failures": sum(item["state"] == "failed" for item in stage_items),
+            "observed_model_attempts": attempt_counts["provider"] or None,
+            "operational_retries": attempt_counts["operational_retry"],
+            "replays": attempt_counts["replay"],
             "results": {
                 name: {
                     "count": counts[name],
@@ -402,7 +438,20 @@ def pricing_config(request: Request, db: Session = Depends(get_session)) -> dict
                     "valid_until": iso(row.valid_until),
                 }
                 for row in rows
-            ]
+            ],
+            "reference_prices": [
+                {
+                    "model": "gpt-6-sol",
+                    "deployment_id": None,
+                    "currency": "USD",
+                    "token_type": token_type,
+                    "rate_per_million": rate,
+                    "valid_from": None,
+                    "valid_until": None,
+                    "active": False,
+                }
+                for token_type, rate in REFERENCE_RATES
+            ],
         },
         request,
     )

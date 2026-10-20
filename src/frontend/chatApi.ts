@@ -52,6 +52,7 @@ export type Ticket = {
     status: string
     servicenow_number: string | null
     internal_category: string
+    resulting_priority: string | null
     created_at: string
 }
 export type TicketPage = { items: Ticket[]; total: number }
@@ -100,7 +101,7 @@ export type IaSummary = {
     replays: number | null
 }
 export type IaDetail = {
-    agent_run_id: string; session_id: string | null; step_name: string; model: string | null
+    agent_run_id: string; session_id: string | null; step_name: string | null; model: string | null
     start_time: string | null; end_time: string | null; duration_ms: number | null
     tokens_input: number | null; tokens_output: number | null; tokens_cache: number | null
     estimated_cost_value: number | null; estimated_cost_currency: 'USD' | null
@@ -114,9 +115,25 @@ export type IaTimeseries = {
     results: { result: IaResult; count: number | null }[]
     stages: { step_name: string; mean_ms: number | null; p95_ms: number | null; max_ms: number | null; sample_size: number }[]
 }
-export type IaPricingConfig = { items: { model: string; deployment_id: string; currency: string; token_type: string; rate_per_million: number; valid_from: string; valid_until: string | null }[] }
+export type IaPricingConfig = {
+    items: { model: string; deployment_id: string; currency: string; token_type: string; rate_per_million: number; valid_from: string; valid_until: string | null }[]
+    reference_prices?: { model: string; deployment_id: null; currency: 'USD'; token_type: string; rate_per_million: number; valid_from: null; valid_until: null; active: false }[]
+}
 
 type Envelope<T> = { data: T | null; error: RunError | null }
+
+type ApiIaSummary = {
+    total_runs: number; results: Record<IaResult, { count: number; percentage: number | null }>
+    terminal_denominator: number; duration: { sample_size: number; average_ms: number | null; p95_ms: number | null }
+    estimated_cost_value: number | null; estimated_cost_currency: 'USD' | null; cost_sample_size: number
+    available_models: string[]; step_failures: number | null; observed_model_attempts: number | null
+    operational_retries: number | null; replays: number | null
+}
+type ApiIaDetail = Omit<IaDetail, 'model'> & { model_used: string | null }
+type ApiIaTimeseries = {
+    days: { date: string; results: Record<IaResult, number> }[]
+    stage_latency: Record<string, { average_ms: number | null; p95_ms: number | null; max_ms: number | null; sample_size: number }>
+}
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
     let response: Response
@@ -184,22 +201,53 @@ export function getAgentRun(agentRunId: string): Promise<AgentRun> {
 }
 
 function iaQuery(filters: IaFilters): string {
-    return new URLSearchParams(Object.entries(filters).filter(([, value]) => value !== '')).toString()
+    const query = new URLSearchParams()
+    if (filters.start_date) query.set('start', `${filters.start_date}T00:00:00Z`)
+    if (filters.end_date) {
+        const nextDay = new Date(`${filters.end_date}T00:00:00Z`)
+        nextDay.setUTCDate(nextDay.getUTCDate() + 1)
+        query.set('end', nextDay.toISOString())
+    }
+    for (const key of ['model', 'step', 'result'] as const) {
+        if (filters[key]) query.set(key, filters[key])
+    }
+    return query.toString()
 }
 
 export function getIaSummary(filters: IaFilters): Promise<IaSummary> {
     const query = iaQuery(filters)
-    return request<IaSummary>(`/api/ia-tab/summary${query ? `?${query}` : ''}`)
+    return request<ApiIaSummary>(`/api/ia-tab/summary${query ? `?${query}` : ''}`).then((data) => ({
+        executions: data.total_runs,
+        available_models: data.available_models,
+        results: Object.fromEntries(Object.entries(data.results).map(([key, value]) => [key, value.count])) as IaSummary['results'],
+        terminal_sample_size: data.terminal_denominator,
+        result_percentages: Object.fromEntries(['respond', 'open_ticket', 'blocked'].map((key) => [key, data.results[key as IaResult].percentage])) as IaSummary['result_percentages'],
+        estimated_cost: { value: data.estimated_cost_value, currency: data.estimated_cost_currency, sample_size: data.cost_sample_size },
+        stage_mean_ms: { value: data.duration.average_ms, sample_size: data.duration.sample_size },
+        stage_p95_ms: { value: data.duration.p95_ms, sample_size: data.duration.sample_size },
+        step_failures: data.step_failures,
+        observed_model_attempts: data.observed_model_attempts,
+        operational_retries: data.operational_retries,
+        replays: data.replays,
+    }))
 }
 
 export function getIaDetails(filters: IaFilters, limit = 20, offset = 0): Promise<IaDetailsPage> {
     const query = new URLSearchParams({ ...Object.fromEntries(new URLSearchParams(iaQuery(filters))), limit: String(limit), offset: String(offset) })
-    return request<IaDetailsPage>(`/api/ia-tab/details?${query}`)
+    return request<{ items: ApiIaDetail[]; total: number }>(`/api/ia-tab/details?${query}`).then((data) => ({
+        total: data.total, items: data.items.map(({ model_used, ...item }) => ({ ...item, model: model_used })),
+    }))
 }
 
 export function getIaTimeseries(filters: IaFilters): Promise<IaTimeseries> {
     const query = iaQuery(filters)
-    return request<IaTimeseries>(`/api/ia-tab/timeseries${query ? `?${query}` : ''}`)
+    return request<ApiIaTimeseries>(`/api/ia-tab/timeseries${query ? `?${query}` : ''}`).then((data) => ({
+        executions: data.days.map((day) => ({ date: day.date, count: Object.values(day.results).reduce((total, count) => total + count, 0) })),
+        results: [],
+        stages: Object.entries(data.stage_latency).map(([step_name, stats]) => ({
+            step_name, mean_ms: stats.average_ms, p95_ms: stats.p95_ms, max_ms: stats.max_ms, sample_size: stats.sample_size,
+        })).filter((stage) => stage.sample_size > 0),
+    }))
 }
 
 export function getIaPricingConfig(): Promise<IaPricingConfig> {

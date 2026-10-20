@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from crewai.types.usage_metrics import UsageMetrics
 from pydantic import ValidationError
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
@@ -242,9 +243,35 @@ def test_servicenow_malformed_confirmation_is_uncertain(
             create_incident(PAYLOAD, "run-1", "servicenow", client)
 
 
+@pytest.mark.parametrize(
+    "category,message,source_path,servicenow_category",
+    [
+        (
+            "password_reset",
+            "Esqueci minha senha corporativa",
+            "knowledge/password_reset.md",
+            "inquiry",
+        ),
+        (
+            "printer_label",
+            "Minha impressora nao esta imprimindo, como solucionar?",
+            "knowledge/printer_label.md",
+            "hardware",
+        ),
+    ],
+)
 @pytest.mark.parametrize("foundry", [False, True])
+@pytest.mark.parametrize("has_usage", [False, True])
+@pytest.mark.parametrize("cached_tokens", [0, 20])
 def test_sequential_crew_stages_validate_local_source(
-    monkeypatch: pytest.MonkeyPatch, foundry: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    foundry: bool,
+    has_usage: bool,
+    cached_tokens: int,
+    category: str,
+    message: str,
+    source_path: str,
+    servicenow_category: str,
 ) -> None:
     monkeypatch.setenv("LLM_MODEL", "azure/demo" if foundry else "test-model")
     if foundry:
@@ -279,23 +306,40 @@ def test_sequential_crew_stages_validate_local_source(
         def kickoff(self):
             schema = self.task.output_pydantic
             sequence.append(schema.__name__)
+            if category == "printer_label" and schema is crew.EvidenceSet:
+                assert "energia e conexao visivel" in self.task.description
+                assert source_path in self.task.description
+            if category == "printer_label" and schema is crew.ResponseDraft:
+                assert "passos iniciais seguros" in self.task.description
             output = {
                 "TriageInput": {
-                    "internal_category": "password_reset",
+                    "internal_category": category,
                     "impact": 3,
                     "urgency": 3,
                     "confidence": 0.9,
                     "risk_flags": ["senha=synthetic-secret"],
                 },
-                "EvidenceSet": {"selected_paths": ["knowledge/password_reset.md"]},
+                "EvidenceSet": {"selected_paths": [source_path]},
                 "ResponseDraft": {
                     "candidate_action": "respond",
-                    "message_pt_br": "Use o fluxo oficial de redefinicao.",
+                    "message_pt_br": (
+                        "Confira energia e conexao visivel."
+                        if category == "printer_label"
+                        else "Use o fluxo oficial de redefinicao."
+                    ),
                     "summary": "Fonte local consultada.",
                 },
                 "PolicyDecision": {"approved": True, "veto_to_blocked": False},
             }[schema.__name__]
-            return SimpleNamespace(pydantic=schema.model_validate(output))
+            return SimpleNamespace(
+                pydantic=schema.model_validate(output),
+                token_usage=UsageMetrics(
+                    prompt_tokens=120,
+                    completion_tokens=30,
+                    cached_prompt_tokens=cached_tokens,
+                    successful_requests=1,
+                ) if has_usage else UsageMetrics(),
+            )
 
     monkeypatch.setattr(crew, "Crew", FakeCrew)
     engine = create_engine("sqlite://")
@@ -307,9 +351,7 @@ def test_sequential_crew_stages_validate_local_source(
         run = AgentRun(session_id=session.session_id)
         db.add(run)
         db.commit()
-        result = crew.run_workflow(
-            "Esqueci minha senha corporativa", 0, db, run.agent_run_id
-        )
+        result = crew.run_workflow(message, 0, db, run.agent_run_id)
         events = db.scalars(select(AgentEvent).order_by(AgentEvent.created_at)).all()
         from app.persistence.models import AgentRunTelemetry
 
@@ -331,8 +373,14 @@ def test_sequential_crew_stages_validate_local_source(
             row.state == "complete" and row.duration_ms >= 0 and row.timestamp_end
             for row in telemetry
         )
+        expected_cache = cached_tokens if has_usage and cached_tokens else None
         assert all(
-            row.model_used is None and row.tokens_input is None for row in telemetry
+            row.model_used == ("azure/demo" if foundry else "test-model")
+            and row.tokens_input == (120 if has_usage else None)
+            and row.tokens_output == (30 if has_usage else None)
+            and row.tokens_cache == expected_cache
+            and row.cache_in_input == (True if has_usage and cached_tokens else None)
+            for row in telemetry
         )
     engine.dispose()
     assert sequence == [
@@ -342,11 +390,11 @@ def test_sequential_crew_stages_validate_local_source(
         "PolicyDecision",
     ]
     assert result["action"] == "respond"
-    assert result["triage"]["servicenow_category"] == "inquiry"
+    assert result["triage"]["servicenow_category"] == servicenow_category
     assert result["triage"]["resulting_priority"] == "P4"
     assert result["triage"]["initial_action"] == "respond"
     assert "synthetic-secret" not in str(result)
-    assert result["sources"][0]["path"] == "knowledge/password_reset.md"
+    assert result["sources"][0]["path"] == source_path
     assert [event.task_id for event in events] == [
         "triage", "knowledge", "response", "policy"
     ]
@@ -558,7 +606,8 @@ def test_crew_stage_failure_records_no_exception_text(
         assert [row.state for row in telemetry] == ["complete", "failed"]
         assert telemetry[1].timestamp_end is not None
         assert telemetry[1].duration_ms >= 0
-        assert telemetry[1].tokens_input is telemetry[1].model_used is None
+        assert telemetry[1].tokens_input is None
+        assert telemetry[1].model_used == "test-model"
     engine.dispose()
     assert [(event.task_id, event.status) for event in events] == [
         ("triage", "validated"), ("knowledge", "failed")

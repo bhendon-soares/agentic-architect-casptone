@@ -4,6 +4,7 @@ import {
     type AdminConversation, type AdminConversationDetail, type AdminConversationPage, type AgentRun, type KnowledgeSource, type Metrics, type RunError, type TicketPage,
 } from './chatApi'
 import IaPanel from './IaPanel'
+import { ErrorCodeLabel, formatDate, formatNumber, IdChip, KpiCard, StatusBadge, ThemeToggle, type Tone } from './ui'
 import './style.css'
 
 const pageSize = 20
@@ -17,14 +18,17 @@ const ticketStatusLabels: Record<string, string> = {
 const conversationStatusLabels: Record<string, string> = {
     active: 'Ativa', completed: 'Concluída', running: 'Em andamento', failed: 'Falhou', blocked: 'Bloqueado',
 }
+const categoryLabels: Record<string, string> = { password_reset: 'Redefinição de senha', app_access: 'Acesso a aplicativo' }
+type Tab = 'overview' | 'conversations' | 'tickets' | 'knowledge' | 'ia'
+const tabs: { id: Tab; label: string }[] = [{ id: 'overview', label: 'Visão geral' }, { id: 'conversations', label: 'Conversas' }, { id: 'tickets', label: 'Tickets' }, { id: 'knowledge', label: 'Conhecimento' }, { id: 'ia', label: 'IA' }]
 
-function conversationState(conversation: AdminConversation): { label: string; tone: string } {
+function conversationState(conversation: AdminConversation): { label: string; tone: Tone } {
     const status = conversation.last_run?.run_status === 'failed' ? 'failed' : conversation.last_run?.final_action || conversation.last_run?.run_status || conversation.status
-    return { label: actionLabels[status] || conversationStatusLabels[status] || status, tone: status === 'failed' || status === 'blocked' ? status : '' }
+    return { label: actionLabels[status] || conversationStatusLabels[status] || 'Estado desconhecido', tone: status === 'failed' ? 'danger' : status === 'blocked' ? 'warning' : status === 'respond' || status === 'open_ticket' ? 'success' : status === 'running' || status === 'ask_clarification' ? 'info' : 'neutral' }
 }
 
 function dateLabel(value: string | null): string {
-    return value ? new Date(value).toLocaleString('pt-BR') : '—'
+    return formatDate(value)
 }
 
 function errorLabel(cause: unknown): string {
@@ -33,7 +37,8 @@ function errorLabel(cause: unknown): string {
 }
 
 export default function AdminConsole() {
-    const [tab, setTab] = useState<'operation' | 'ia'>('operation')
+    const [tab, setTab] = useState<Tab>('overview')
+    const [refreshedAt, setRefreshedAt] = useState<string | null>(null)
     const [metrics, setMetrics] = useState<Metrics | null>(null)
     const [conversations, setConversations] = useState<AdminConversationPage | null>(null)
     const [conversationOffset, setConversationOffset] = useState(0)
@@ -60,6 +65,7 @@ export default function AdminConsole() {
         if (results.some((result) => result.status === 'rejected')) {
             setError('Alguns dados não puderam ser carregados. Atualize para tentar novamente.')
         }
+        setRefreshedAt(new Date().toISOString())
         setLoading(false)
     }
 
@@ -120,53 +126,53 @@ export default function AdminConsole() {
     const run = selectedRun ? runs[selectedRun] : null
 
     function inspectConversation(id: string) {
-        setTab('operation')
+        setTab('conversations')
         void openSession(id)
     }
 
     function inspectRun(id: string) {
-        setTab('operation')
+        setTab('conversations')
         void openRun(id)
     }
 
     return (
         <div className="app-shell">
             <header className="topbar">
-                <div className="brand"><span className="brand-mark" aria-hidden="true">S/</span><span>Suporte TI <small>interno</small></span></div>
+                <a className="brand" href="/" aria-label="Help Desk TI Multi Agent MVP - voltar ao chat"><span className="brand-mark" aria-hidden="true">S/</span><span>Help Desk TI Multi Agent MVP</span></a>
                 <a className="topbar-link" href="/">Voltar ao chat</a>
+                <ThemeToggle />
                 <span className="demo-label">DEMONSTRAÇÃO · DADOS FICTÍCIOS</span>
             </header>
             <main className="admin-workspace">
                 <nav className="admin-tabs" aria-label="Visões do console">
-                    <button type="button" aria-current={tab === 'operation' ? 'page' : undefined} onClick={() => setTab('operation')}>Operação</button>
-                    <button type="button" aria-current={tab === 'ia' ? 'page' : undefined} onClick={() => setTab('ia')}>IA</button>
+                    {tabs.map((item) => <button type="button" key={item.id} aria-current={tab === item.id ? 'page' : undefined} onClick={() => setTab(item.id)}>{item.label}</button>)}
                 </nav>
                 <div className="admin-heading">
-                    <div><p className="eyebrow">OPERAÇÃO / CONSOLE</p><h1>{tab === 'ia' ? 'IA' : 'Visão operacional'}</h1><p>{tab === 'ia' ? 'Consumo, resultados e latência das execuções.' : 'Atendimentos, incidentes e rastreabilidade da decisão.'}</p></div>
-                    {tab === 'operation' && <button type="button" className="admin-command" onClick={() => void refresh()} disabled={loading}>Atualizar dados</button>}
+                    <div><p className="eyebrow">SUPORTE / CONSOLE</p><h1>{tabs.find((item) => item.id === tab)?.label}</h1>{tab === 'overview' && refreshedAt && <p>Atualizado em {dateLabel(refreshedAt)}</p>}</div>
+                    {tab === 'overview' && <button type="button" className="admin-command" onClick={() => void refresh()} disabled={loading}>Atualizar dados</button>}
                 </div>
                 {tab === 'ia' ? <IaPanel onConversation={inspectConversation} onRun={inspectRun} /> : <>
                     {error && <p role="alert" className="admin-error">{error}</p>}
                     {loading && <p role="status" className="admin-muted">Carregando dados…</p>}
 
-                    <section aria-label="Métricas" className="admin-metrics">
+                    {tab === 'overview' && <section aria-label="Métricas" className="admin-metrics">
                         {[
-                            ['Conversas', metrics?.total_conversations],
-                            ['Tickets criados', metrics?.tickets_created],
-                            ['Respostas com fonte', metrics?.responses_with_source],
-                            ['Pedidos bloqueados', metrics?.blocked_requests],
-                        ].map(([label, value]) => <div className="admin-metric" key={label}><span>{label}</span><strong>{value ?? '—'}</strong></div>)}
-                    </section>
+                            ['Conversas', metrics?.total_conversations, 'Total de conversas registrado pelo servidor.'],
+                            ['Tickets criados', metrics?.tickets_created, 'Tickets criados conforme a contagem do servidor.'],
+                            ['Respostas com fonte', metrics?.responses_with_source, 'Respostas com fonte conforme a contagem do servidor.'],
+                            ['Pedidos bloqueados', metrics?.blocked_requests, 'Pedidos barrados pela política; não são falhas técnicas.'],
+                        ].map(([label, value, definition]) => <KpiCard key={label} label={String(label)} value={formatNumber(value as number | undefined)} definition={String(definition)} />)}
+                    </section>}
 
-                    <div className="admin-layout">
+                    {(tab === 'conversations' || tab === 'tickets' || tab === 'knowledge') && <div className="admin-layout">
                         <div className="admin-column">
-                            <section className="admin-section admin-conversations" aria-labelledby="conversations-heading">
+                            {tab === 'conversations' && <section className="admin-section admin-conversations" aria-labelledby="conversations-heading">
                                 <div className="admin-section-heading"><h2 id="conversations-heading">Conversas</h2><span>{conversations ? `${conversations.total} no total` : '—'}</span></div>
                                 {conversations?.items.length === 0 && <p className="admin-muted">Nenhuma conversa registrada.</p>}
                                 {conversations?.items.map((conversation) => {
                                     const state = conversationState(conversation)
                                     return <article className="admin-row" key={conversation.session_id}>
-                                        <div><strong>Conversa {conversation.session_id.slice(0, 8)}</strong><span className="admin-row-meta">{dateLabel(conversation.last_activity_at)} · <span className={`admin-state ${state.tone}`}>{state.label}</span>{conversation.last_run?.error_code ? ` · ${conversation.last_run.error_code}` : ''}</span></div>
+                                        <div><strong>Conversa <IdChip id={conversation.session_id} /></strong><span className="admin-row-meta">{dateLabel(conversation.last_activity_at)} · <StatusBadge tone={state.tone}>{state.label}</StatusBadge> {<ErrorCodeLabel code={conversation.last_run?.error_code ?? null} />}</span></div>
                                         <button type="button" className="admin-text-button" onClick={() => void openSession(conversation.session_id)}>Ver detalhes</button>
                                     </article>
                                 })}
@@ -175,13 +181,13 @@ export default function AdminConsole() {
                                     <span>{conversationOffset + 1}–{Math.min(conversationOffset + pageSize, conversations.total)} de {conversations.total}</span>
                                     <button type="button" disabled={loading || conversationOffset + pageSize >= conversations.total} onClick={() => void loadConversations(conversationOffset + pageSize)}>Próxima</button>
                                 </div>}
-                            </section>
-                            <section className="admin-section" aria-labelledby="tickets-heading">
+                            </section>}
+                            {tab === 'tickets' && <section className="admin-section" aria-labelledby="tickets-heading">
                                 <div className="admin-section-heading"><h2 id="tickets-heading">Tickets</h2><span>{tickets ? `${tickets.total} no total` : '—'}</span></div>
                                 {tickets?.items.length === 0 && <p className="admin-muted">Nenhum ticket registrado.</p>}
                                 {tickets?.items.map((ticket) => <article className="admin-row" key={ticket.ticket_id}>
-                                    <div><strong>{ticket.servicenow_number || ticket.ticket_id}</strong><span>{ticket.internal_category} · {dateLabel(ticket.created_at)}</span></div>
-                                    <span className={`admin-state ${ticket.status}`}>{ticketStatusLabels[ticket.status] || ticket.status}</span>
+                                    <div><strong><IdChip id={ticket.servicenow_number || ticket.ticket_id} /></strong><span>{categoryLabels[ticket.internal_category] || ticket.internal_category} · Prioridade: {ticket.resulting_priority ?? 'não disponível'} · {dateLabel(ticket.created_at)}</span></div>
+                                    <StatusBadge tone={ticket.status === 'created' && ticket.servicenow_number ? 'success' : ticket.status === 'outcome_unknown' ? 'warning' : ticket.status === 'failed' ? 'danger' : 'neutral'}>{ticket.status === 'created' && ticket.servicenow_number ? 'Criado' : ticket.status === 'outcome_unknown' ? 'Resultado incerto' : ticket.status === 'failed' ? 'Falhou' : 'Estado a verificar'}</StatusBadge>
                                     <button type="button" className="admin-text-button" onClick={() => void openSession(ticket.session_id)}>Ver conversa</button>
                                     <button type="button" className="admin-text-button" onClick={() => void openRun(ticket.agent_run_id)}>Ver eventos</button>
                                 </article>)}
@@ -190,19 +196,19 @@ export default function AdminConsole() {
                                     <span>{offset + 1}–{Math.min(offset + pageSize, tickets.total)} de {tickets.total}</span>
                                     <button type="button" disabled={loading || offset + pageSize >= tickets.total} onClick={() => { const next = offset + pageSize; setOffset(next); void refresh(next) }}>Próxima</button>
                                 </div>}
-                            </section>
+                            </section>}
 
-                            <section className="admin-section" aria-labelledby="sources-heading">
+                            {tab === 'knowledge' && <section className="admin-section" aria-labelledby="sources-heading">
                                 <div className="admin-section-heading"><h2 id="sources-heading">Fontes de conhecimento</h2><span>{sources?.length ?? '—'}</span></div>
                                 {sources?.length === 0 && <p className="admin-muted">Nenhuma fonte cadastrada.</p>}
                                 {sources?.map((source) => <div className="admin-row" key={source.path}>
-                                    <div><strong>{source.title}</strong><span>{source.path} · {source.internal_category}</span></div>
-                                    <span className={`admin-state ${source.approved ? 'created' : ''}`}>{source.approved ? 'Aprovada' : 'Pendente'}</span>
+                                    <div><strong>{source.title}</strong><span>{source.path} · {categoryLabels[source.internal_category] || source.internal_category}</span></div>
+                                    <StatusBadge tone={source.approved ? 'success' : 'neutral'}>{source.approved ? 'Aprovada' : 'Pendente'}</StatusBadge>
                                 </div>)}
-                            </section>
+                            </section>}
                         </div>
 
-                        <section className="admin-section admin-detail" aria-labelledby="conversation-heading">
+                        {(tab === 'conversations' || tab === 'tickets') && <section className="admin-section admin-detail" aria-labelledby="conversation-heading">
                             <div className="admin-section-heading"><h2 id="conversation-heading">Conversa e decisões</h2></div>
                             <form className="admin-lookup" onSubmit={lookup}>
                                 <label htmlFor="session-id">ID da conversa</label>
@@ -212,7 +218,7 @@ export default function AdminConsole() {
                             {detailLoading && <p role="status" className="admin-muted">Carregando detalhes…</p>}
                             {detailError && <p role="alert" className="admin-error">{detailError}</p>}
                             {history && <div className="admin-history">
-                                <p className="admin-id">Conversa {history.session_id}</p>
+                                <p className="admin-id">Conversa <IdChip id={history.session_id} /></p>
                                 <p className="admin-muted">{conversationStatusLabels[history.status] || history.status} · Criada em {dateLabel(history.created_at)} · Atualizada em {dateLabel(history.updated_at)}</p>
                                 {history.messages.length === 0 && <p className="admin-muted">Ainda não há mensagens.</p>}
                                 {history.messages.map((message) => <div className="admin-message" key={message.message_id}>
@@ -222,22 +228,22 @@ export default function AdminConsole() {
                                 <h3>Decisões e execuções</h3>
                                 {history.runs.length === 0 && <p className="admin-muted">Nenhuma execução registrada.</p>}
                                 {history.runs.map((execution) => <div className="admin-turn" key={execution.agent_run_id}>
-                                    <div><strong className={`admin-state ${execution.status === 'failed' ? 'failed' : execution.final_action === 'blocked' ? 'blocked' : ''}`}>{execution.status === 'failed' ? conversationStatusLabels.failed : execution.final_action ? actionLabels[execution.final_action] : conversationStatusLabels[execution.status] || execution.status}</strong><span>{execution.summary || execution.error_code || execution.status} · {dateLabel(execution.started_at)}</span></div>
+                                    <div><StatusBadge tone={execution.status === 'failed' ? 'danger' : execution.final_action === 'blocked' ? 'warning' : execution.final_action === 'respond' || execution.final_action === 'open_ticket' ? 'success' : 'info'}>{execution.status === 'failed' ? 'Falhou' : execution.final_action ? actionLabels[execution.final_action] : conversationStatusLabels[execution.status] || 'Estado desconhecido'}</StatusBadge><span>{execution.summary || execution.status} · {dateLabel(execution.started_at)} <ErrorCodeLabel code={execution.error_code} /></span></div>
                                     <button type="button" className="admin-text-button" onClick={() => void openRun(execution.agent_run_id)}>Ver eventos</button>
-                                    {history.tickets.filter((ticket) => ticket.agent_run_id === execution.agent_run_id).map((ticket) => <p key={ticket.ticket_id}>Ticket: {ticket.servicenow_number || ticket.ticket_id} · {ticketStatusLabels[ticket.status] || ticket.status}{ticket.error_code ? ` · ${ticket.error_code}` : ''}</p>)}
+                                    {history.tickets.filter((ticket) => ticket.agent_run_id === execution.agent_run_id).map((ticket) => <p key={ticket.ticket_id}>Ticket: {ticket.servicenow_number || ticket.ticket_id} · {ticket.status === 'created' && ticket.servicenow_number ? 'Criado' : ticketStatusLabels[ticket.status] || 'Estado a verificar'} <ErrorCodeLabel code={ticket.error_code} /></p>)}
                                     {execution.sources.map((source) => <p key={source.path}>Fonte: {source.title} · {source.path}</p>)}
                                 </div>)}
                             </div>}
                             {run && <div className="admin-events"><h3>Eventos da execução</h3><p className="admin-id">{run.agent_run_id} · {run.status}{run.error_code ? ` · ${run.error_code}` : ''}</p>
                                 {run.events.length === 0 && <p className="admin-muted">Nenhum evento registrado.</p>}
-                                {run.events.map((event) => <div className="admin-event" key={event.event_id}>
+                                {run.events.map((event) => <div className="admin-event" data-agent={event.task_id} key={event.event_id}>
                                     <strong>{event.producer} · {event.task_id}</strong><span>{event.status} · {dateLabel(event.created_at)}</span>
-                                    {event.payload != null && <pre>{JSON.stringify(event.payload, null, 2)}</pre>}
-                                    {event.validation_errors != null && <pre>{JSON.stringify(event.validation_errors, null, 2)}</pre>}
+                                    {event.task_id === 'decision' && event.payload != null && typeof event.payload === 'object' && 'final_action' in event.payload && typeof event.payload.final_action === 'string' && <p>Desfecho: {actionLabels[event.payload.final_action] || event.payload.final_action}</p>}
+                                    <details><summary>Ver payload</summary>{event.payload == null || (Array.isArray(event.payload) && event.payload.length === 0) || (typeof event.payload === 'object' && !Array.isArray(event.payload) && Object.keys(event.payload).length === 0) ? <p>Esta etapa não registrou detalhes</p> : <pre>{JSON.stringify(event.payload, null, 2)}</pre>}{event.validation_errors != null && <pre>{JSON.stringify(event.validation_errors, null, 2)}</pre>}</details>
                                 </div>)}
                             </div>}
-                        </section>
-                    </div>
+                        </section>}
+                    </div>}
                 </>}
             </main>
         </div>

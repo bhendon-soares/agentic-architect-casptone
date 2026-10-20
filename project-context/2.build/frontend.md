@@ -1,6 +1,17 @@
-# Frontend Build: primeira etapa do chat de suporte
+# Frontend Build: UI integrada e historico da primeira etapa
+
+## Redesign da UI integrada (A) e limites (B)
+
+- Entregue: tema Sistema/Claro/Escuro, componentes compartilhados, chat com estados de resultado distintos e fonte sem caminho/trecho, cinco abas do console, timeline com payload redigido recolhido, IA com dados apenas do servidor, custo `null` distinto de zero e p95/maximo mascarados abaixo de 20 amostras. Nenhum endpoint novo ou alteracao de regras de ticket foi introduzido.
+- Propostas B, sem implementacao de backend: reconciliacao autoritativa de tickets apos recarga/dispositivos, denominadores e cobertura de telemetria global, semantica tipada de eventos/rotulos de categorias. Contrato proposto e condicoes de aceite constam em `frontend-funcional-spec.md`; dependem de backend/integracao.
+- Verificacao: 27 testes de UI aprovados (`corepack npm test -- --run`); `corepack npm run typecheck` e `corepack npm run build` aprovados. Nao existe script de lint no pacote. `.venv/bin/aamad validate --phase build` passou com aviso: `evals.md` recomendado antes de Deliver.
+- Navegador local: chat e console sem overflow da pagina em 320, 390 e 1280 px; IA tem scroll proprio na tabela. Alternancia claro/escuro confirmada. Contrastes texto/superficie 18,27:1 claro e 14,64:1 escuro; secundario 6,71:1 e 6,94:1; botao primario 6,29:1 e 9,52:1. Verificacao visual feita em estados carregados existentes; nao comprova todas as combinacoes de dados ou integracao ServiceNow real.
+
+## Historico: primeira etapa e contrato inicial de IA
 
 ## FR-009: aba IA (P1) - contrato assumido para @integration.eng
+
+Atualizacao: a API entrega `pricing-config.data.reference_prices` com os quatro precos de referencia informados em USD por milhao de tokens (entrada 2,00; cache 0,20; escrita de cache 2,50; saida 10,00), `active:false`, sem deployment ou vigencia comprovados. A UI atual mostra estas referencias recolhidas, sem exemplos ou calculos de custo no cliente. `items` continua restrito a tarifas ativas; nenhuma referencia habilita custo por execucao sem tarifa aplicavel e consumo confiavel. A proposta inicial abaixo permanece como historico.
 
 - Aba IA integrada ao console admin existente; Operacao, detalhes de conversa/execucao e chat permanecem nas rotas P0. Nao ha dados de demonstracao ou precos de fallback em producao: sem endpoints P1 disponiveis, a aba mostra erro e permite nova tentativa. Fixtures existem apenas nos testes de UI.
 - Todas as quatro rotas `GET /api/ia-tab/{summary,details,timeseries,pricing-config}` usam `{ "data": T, "error": null, "meta": { "request_id": "...", "agent_run_id": "..." } }` no sucesso e `data: null` + erro `{ code, message, retryable }` na falha. `meta` pode conter outros campos; o cliente nao usa metadados para calcular metricas. Nomes de campos abaixo sao **proposta frontend** a confirmar com backend/integration, nao API P1 ja entregue.

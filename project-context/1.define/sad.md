@@ -65,7 +65,7 @@ O documento respeita o MRD/PRD como fonte de verdade, o runtime `crewai`, proces
 | ADR-007 | Backend chama adapter ServiceNow real ou mock/local somente apos persistir `final_action=open_ticket` | Agente prepara payload redigido sem acesso a ferramenta mutating; testes independem de ServiceNow externo | PRD FR-006 |
 | ADR-008 | Backend persiste `final_action` como autoridade final | `ResponseAgent` propoe `candidate_action`, `QAPolicyAgent` veta, backend valida e grava; `initial_action` de FR-002 e a sugestao inicial, nao uma segunda decisao persistida | PRD FR-002; PRD Decision Rules |
 | ADR-009 | Console admin aberto no P0 | Decisao fechada de produto; RBAC/auth ficam fora do MVP | PRD NFR Security & Compliance |
-| ADR-010 | Tabelas de telemetria P1 separadas de P0; "nao disponivel" normalizado para campos sem medicao confiavel | Aba IA como incremento P1 nao altera P0; medicao de tokens, tentativas e precos depende de confirmacao Azure Foundry; nao usar zero ficticio | PRD FR-009 Criteria de Aceite; PRD Future Features |
+| ADR-010 | Tabelas de telemetria P1 separadas de P0; "nao disponivel" normalizado para campos sem medicao confiavel | Aba IA nao altera P0; precos de referencia informados sao visiveis, mas custo por execucao exige tokens confiaveis e tarifa aplicavel ao deployment; nao usar zero ficticio | PRD FR-009 Criteria de Aceite; PRD Future Features |
 
 ## 2. Multi-Agent System Specification
 
@@ -499,11 +499,13 @@ sequenceDiagram
 
 **Tabela de Precos Versionada**:
 
+Os quatro precos de referencia abaixo foram informados pelo operador e sao exibidos na aba IA mesmo sem tarifa ativa. Nao cadastrar como vigentes sem confirmar o deployment e a vigencia contratual.
+
 | Modelo | Deployment | Moeda | Tipo Token | Tarifa (por 1M) | Vigencia Inicio | Vigencia Fim | Ativo |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
 | `gpt-6-sol` | `azure/gpt-6-sol` (a confirmar) | USD | entrada | $2.00 | TBD | TBD | false |
-| `gpt-6-sol` | `azure/gpt-6-sol` (a confirmar) | USD | entrada_cache | $0.20 | TBD | TBD | false |
-| `gpt-6-sol` | `azure/gpt-6-sol` (a confirmar) | USD | escrita_cache | $2.50 | TBD | TBD | false |
+| `gpt-6-sol` | `azure/gpt-6-sol` (a confirmar) | USD | cache | $0.20 | TBD | TBD | false |
+| `gpt-6-sol` | `azure/gpt-6-sol` (a confirmar) | USD | cache_write | $2.50 | TBD | TBD | false |
 | `gpt-6-sol` | `azure/gpt-6-sol` (a confirmar) | USD | saida | $10.00 | TBD | TBD | false |
 
 **Calculo de Custo Estimado**:
@@ -515,18 +517,16 @@ sequenceDiagram
 - **Jamais exibir custo zero ficticio**. Sem tarifa valida, moeda compativel ou consumo suficiente, mostrar **"nao disponivel"**.
 
 **Dependencias para Habilitar Estimativas**:
-- Confirmar no Azure Foundry: SKU exato de `azure/gpt-6-sol`, tipo e regiao do deployment, faixa de contexto, preco contratado e inicio/fim de vigencia.
+- Confirmar no Azure Foundry: SKU exato de `azure/gpt-6-sol`, tipo e regiao do deployment, faixa de contexto, aplicabilidade dos precos informados e inicio/fim de vigencia.
 - Cadastrar tarifa aplicavel em `pricing_config_versions` com flags de ativo=true e vigencia apropriada.
 - Dispor de consumo de tokens confiavel do provider para 20+ execucoes.
 - **Sem confirmacao e cadastro, exibir "nao disponivel"**, nao presumir equivalencia automatica com tarifa publica.
 
-**Referencia Publica (Planejamento Apenas, Nao Tarifa Aplicavel)**:
-- Fonte: Microsoft Azure OpenAI pricing (2026-01-XX).
-- Modelo GPT-6 Sol, Global Standard, contexto curto.
-- Hipotese: 1.000 tokens entrada + 500 tokens saida por etapa, sem cache.
-- Custo por etapa: (1.000 / 1.000.000 * $2.00) + (500 / 1.000.000 * $10.00) = $0.007.
-- Se 5 etapas por execucao com consumo identico: $0.035/execucao, $35/1.000 execucoes.
-- Sao premissas de volume e tarifa publica, nao medicoes de uso nem previsao de fatura.
+**Exemplos de Referencia (Sem Cache, Nao Tarifa Aplicavel Automaticamente)**:
+- Uma interacao simples: 2.000 tokens entrada + 500 tokens saida = USD 0,009.
+- Uma interacao maior: 10.000 tokens entrada + 2.000 tokens saida = USD 0,040.
+- 1.000 interacoes simples: 2 milhoes tokens entrada + 500 mil tokens saida = USD 9,00.
+- Sao exemplos calculados com os precos informados, nao medicoes de uso nem previsao de fatura.
 
 **Contadores de Tentativas e Replays**:
 - **Tentativa real**: envio observado ao LLM provider no limite do transporte, incluindo retries internos apenas quando instrumentados; eventos de chamada logica do CrewAI e `successful_requests` nao sao proxy.
@@ -677,8 +677,8 @@ O arquivo `project-context/1.define/sfs/multi-agent-support-flow.md` foi mantido
 
 **P1: Assumptions sobre Telemetria e Precos (FR-009)**:
 - CrewAI fornece `CrewOutput` com agregacoes de tokens por etapa quando `kickoff()` bem-sucedido; nao presume zero para campos ausentes.
-- Adapter `azure/gpt-6-sol` e configurado conforme ambiente; SKU, deployment, regiao e tarifa sao pendentes de confirmacao com Azure Foundry.
-- Tarifa publica de $2.00/$10.00/etc. nao presume equivalencia com preco contratado; necessaria confirmacao explicita.
+- Adapter `azure/gpt-6-sol` e configurado conforme ambiente; SKU, deployment, regiao, vigencia e aplicabilidade dos precos informados sao pendentes de confirmacao com Azure Foundry.
+- Os precos informados de USD 2,00/0,20/2,50/10,00 por milhao de tokens sao referencia visivel, mas nao presumem equivalencia com preco contratado.
 - CrewAI fornece eventos de chamadas logicas e tasks, mas nao contador confiavel de envios reais ao provider incluindo retries internos; estes exigem instrumentacao de transporte validada.
 - Duracao por etapa e medida no backend com relogio monotonicamente crescente, inclusive em falha; a aba IA opera somente em USD, sem conversao cambial.
 - Replays idempotentes sao distinguiveis por estado de cache/persistencia; nao inferir replay a partir de `kickoff()` bem-sucedido.
@@ -686,10 +686,11 @@ O arquivo `project-context/1.define/sfs/multi-agent-support-flow.md` foi mantido
 
 ## Open Questions
 
-- **Azure Foundry SKU e Tarifa (Bloqueante para FR-009 Pricing)**: Qual e o SKU exato de `azure/gpt-6-sol`, tipo de deployment (por exemplo, Global Standard), regiao, faixa de contexto, preco contratado USD por 1M tokens (entrada, saida, cache quando aplicavel) e datas de vigencia? Sem confirmacao e cadastro em `pricing_config_versions`, a aba IA exibira "nao disponivel" para custo estimado.
+- **Azure Foundry SKU e Vigencia (Bloqueante para Custo por Execucao)**: Qual e o SKU exato de `azure/gpt-6-sol`, tipo de deployment (por exemplo, Global Standard), regiao, faixa de contexto, aplicabilidade dos precos de referencia informados e datas de vigencia? Sem confirmacao e cadastro em `pricing_config_versions`, a aba IA exibe os precos de referencia, mas "nao disponivel" para custo estimado de execucoes.
 
 ## Audit
 
+- 2026-10-19: operador informou precos de referencia USD por 1 milhao de tokens (entrada 2,00; cache 0,20; escrita cache 2,50; saida 10,00) e exemplos sem cache de USD 0,009 / 0,040 / 9,00. Frontend e API exibem referencias independentemente de tarifas ativas; custo por execucao continua condicionado ao deployment, vigencia e consumo confiavel.
 - Data: 2026-10-19; decisao do operador: aba IA somente em USD. Pesquisa no runtime local: eventos CrewAI observam chamadas logicas e tasks, nao garantem cada envio/retry do SDK; medir duracao da etapa no backend com `time.perf_counter()` inclusive em falha. Fechadas as tres questoes de tentativas, latencia e conversao; SKU/tarifa Azure permanece pendente. Validacao: `git diff --check`.
 - Data/hora: 2026-10-19T20:36:43-03:00
 - Persona id: `system-arch`
