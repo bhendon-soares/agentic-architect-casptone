@@ -19,6 +19,8 @@ from app.persistence.database import get_session
 from app.persistence.models import (
     AgentEvent,
     AgentRun,
+    AgentRunAttempt,
+    AgentRunResultsSummary,
     ChatMessage,
     ChatSession,
     KnowledgeSource,
@@ -187,6 +189,10 @@ def ticket_data(ticket: Ticket) -> dict:
     }
 
 
+def record_result(db: Session, run: AgentRun, result: str) -> None:
+    db.add(AgentRunResultsSummary(agent_run_id=run.agent_run_id, result=result))
+
+
 @app.get("/health")
 def health(request: Request) -> dict:
     return envelope({"status": "ok"}, request)
@@ -244,6 +250,14 @@ def post_message(
                 )
             if previous.status == "running":
                 return failure(request, "TURN_IN_PROGRESS", 409, previous.agent_run_id)
+            db.add(
+                AgentRunAttempt(
+                    agent_run_id=previous.agent_run_id,
+                    attempt_type="replay",
+                    outcome="success" if not previous.error_code else "failure",
+                )
+            )
+            db.commit()
             if previous.error_code:
                 status = {
                     "TICKET_CREATE_FAILED": 502,
@@ -266,8 +280,28 @@ def post_message(
         idempotency_key=idempotency_key,
         request_hash=request_hash,
     )
+    prior_failure = db.scalar(
+        select(AgentRun)
+        .where(
+            AgentRun.session_id == session_id,
+            AgentRun.request_hash == request_hash,
+            AgentRun.status.in_(("failed", "outcome_unknown")),
+        )
+        .order_by(AgentRun.started_at.desc())
+        .limit(1)
+    )
+    if prior_failure is not None:
+        run.original_run_id = prior_failure.agent_run_id
     db.add(run)
     db.flush()
+    if prior_failure is not None:
+        db.add(
+            AgentRunAttempt(
+                agent_run_id=run.agent_run_id,
+                attempt_type="operational_retry",
+                outcome="started",
+            )
+        )
     db.add(
         ChatMessage(
             session_id=session_id,
@@ -338,6 +372,8 @@ def post_message(
             }
     except RuntimeUnavailable:
         run.status, run.error_code = "failed", "RUNTIME_UNAVAILABLE"
+        run.finished_at = datetime.now(timezone.utc)
+        record_result(db, run, "failed")
         db.commit()
         return failure(request, "RUNTIME_UNAVAILABLE", 503, run.agent_run_id)
     except Exception as exc:
@@ -359,6 +395,8 @@ def post_message(
         if reason == "MINIMUM_TICKET_DATA_MISSING":
             code = reason
         run.status, run.error_code = "failed", code
+        run.finished_at = datetime.now(timezone.utc)
+        record_result(db, run, "failed")
         db.add(
             AgentEvent(
                 agent_run_id=run.agent_run_id,
@@ -370,18 +408,27 @@ def post_message(
             )
         )
         db.commit()
-        return failure(request, code, 422 if code == "MINIMUM_TICKET_DATA_MISSING" else 502, run.agent_run_id)
+        return failure(
+            request,
+            code,
+            422 if code == "MINIMUM_TICKET_DATA_MISSING" else 502,
+            run.agent_run_id,
+        )
 
     action = result["action"]
     if action not in ("respond", "ask_clarification", "open_ticket", "blocked") or (
         action == "respond" and not result["sources"]
     ):
         run.status, run.error_code = "failed", "AGENT_OUTPUT_INVALID"
+        run.finished_at = datetime.now(timezone.utc)
+        record_result(db, run, "failed")
         db.commit()
         return failure(request, "AGENT_OUTPUT_INVALID", 502, run.agent_run_id)
     if action == "ask_clarification":
         if record.clarification_count:
             run.status, run.error_code = "failed", "AGENT_OUTPUT_INVALID"
+            run.finished_at = datetime.now(timezone.utc)
+            record_result(db, run, "failed")
             db.commit()
             return failure(request, "AGENT_OUTPUT_INVALID", 502, run.agent_run_id)
         record.clarification_count += 1
@@ -410,8 +457,7 @@ def post_message(
             )
             validated_payload = TicketPayloadDraft.model_validate(payload)
             assert (
-                validated_triage.confidence >= 0.70
-                or record.clarification_count == 1
+                validated_triage.confidence >= 0.70 or record.clarification_count == 1
             )
             assert not validated_triage.missing_required_fields
             assert validated_payload.impact == validated_triage.impact
@@ -419,6 +465,8 @@ def post_message(
             assert validated_payload.category == validated_triage.servicenow_category
         except (AssertionError, AttributeError, TypeError, ValueError):
             run.status, run.error_code = "failed", "AGENT_OUTPUT_INVALID"
+            run.finished_at = datetime.now(timezone.utc)
+            record_result(db, run, "failed")
             db.commit()
             return failure(request, "AGENT_OUTPUT_INVALID", 502, run.agent_run_id)
         ticket = Ticket(
@@ -442,6 +490,7 @@ def post_message(
             run.status = ticket.status = "outcome_unknown" if uncertain else "failed"
             run.error_code = ticket.error_code = code
             run.finished_at = datetime.now(timezone.utc)
+            record_result(db, run, action)
             db.add(
                 AgentEvent(
                     agent_run_id=run.agent_run_id,
@@ -483,6 +532,7 @@ def post_message(
     run.response_data = turn
     run.status = "completed"
     run.finished_at = datetime.now(timezone.utc)
+    record_result(db, run, action)
     db.add(
         ChatMessage(
             session_id=session_id,
@@ -565,21 +615,18 @@ def list_conversations(
         .group_by(activities.c.session_id)
         .subquery()
     )
-    ranked_runs = (
-        select(
-            AgentRun.session_id,
-            AgentRun.status,
-            AgentRun.final_action,
-            AgentRun.error_code,
-            func.row_number()
-            .over(
-                partition_by=AgentRun.session_id,
-                order_by=(AgentRun.started_at.desc(), AgentRun.agent_run_id.desc()),
-            )
-            .label("position"),
+    ranked_runs = select(
+        AgentRun.session_id,
+        AgentRun.status,
+        AgentRun.final_action,
+        AgentRun.error_code,
+        func.row_number()
+        .over(
+            partition_by=AgentRun.session_id,
+            order_by=(AgentRun.started_at.desc(), AgentRun.agent_run_id.desc()),
         )
-        .subquery()
-    )
+        .label("position"),
+    ).subquery()
     total = db.scalar(select(func.count()).select_from(ChatSession)) or 0
     rows = db.execute(
         select(ChatSession, last_activity.c.at, ranked_runs)
@@ -824,3 +871,8 @@ def knowledge_sources(request: Request, db: Session = Depends(get_session)) -> d
         },
         request,
     )
+
+
+from app.ia_tab import router as ia_router  # noqa: E402
+
+app.include_router(ia_router, dependencies=[Depends(local_admin)])

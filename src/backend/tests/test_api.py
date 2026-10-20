@@ -21,7 +21,15 @@ from starlette.requests import Request
 from app.adapters.tickets import TicketOutcomeUnknown, TicketRejected
 from app.main import app, local_admin
 from app.persistence.database import get_session
-from app.persistence.models import AgentRun, Base, ChatMessage, ChatSession
+from app.persistence.models import (
+    AgentRun,
+    AgentRunAttempt,
+    AgentRunTelemetry,
+    Base,
+    ChatMessage,
+    ChatSession,
+    PricingConfigVersion,
+)
 from app.runtime.crew import InvalidAgentOutput
 from app.runtime.policy import CATEGORIES, priority
 
@@ -72,7 +80,9 @@ def test_session_and_admin_reads(client: TestClient) -> None:
     assert client.get("/api/metrics/summary").json()["data"]["total_conversations"] == 1
 
 
-def test_missing_ticket_data_after_clarification(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_missing_ticket_data_after_clarification(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     def workflow(message, clarification_count, db, agent_run_id):
         assert clarification_count == 1
         raise InvalidAgentOutput("Minimum ticket data missing")
@@ -94,12 +104,16 @@ def test_missing_ticket_data_after_clarification(client: TestClient, monkeypatch
     history = client.get(f"/api/chat/sessions/{session_id}").json()["data"]
     assert history["turns"] == []
     assert history["messages"][0]["agent_run_id"] == run_id
-    assert history["outcomes"] == [{
-        "agent_run_id": run_id,
-        "code": "MINIMUM_TICKET_DATA_MISSING",
-        "message_pt_br": response.json()["error"]["message"],
-    }]
-    assert client.get(f"/api/agent-runs/{run_id}").json()["data"]["final_action"] is None
+    assert history["outcomes"] == [
+        {
+            "agent_run_id": run_id,
+            "code": "MINIMUM_TICKET_DATA_MISSING",
+            "message_pt_br": response.json()["error"]["message"],
+        }
+    ]
+    assert (
+        client.get(f"/api/agent-runs/{run_id}").json()["data"]["final_action"] is None
+    )
     assert client.get("/api/tickets").json()["data"]["total"] == 0
 
 
@@ -273,6 +287,10 @@ def test_blocked_before_crew(
     history = client.get(f"/api/chat/sessions/{session_id}").json()["data"]
     assert "sentinel-42" not in str(history)
     assert history["messages"][0]["message_pt_br"].count("[REDACTED]") == 1
+    ia = client.get("/api/ia-tab/summary").json()["data"]
+    assert ia["total_runs"] == 1
+    assert ia["telemetry_rows"] == 0
+    assert ia["estimated_cost_value"] is None
 
 
 def test_low_confidence_after_question_creates_mock_ticket(
@@ -482,6 +500,269 @@ def test_response_replay_and_clarification(
     assert (
         client.get("/api/metrics/summary").json()["data"]["responses_with_source"] == 1
     )
+    db = next(app.dependency_overrides[get_session]())
+    assert db.query(AgentRunAttempt).filter_by(attempt_type="replay").count() == 1
+    assert client.get("/api/ia-tab/summary").json()["data"]["total_runs"] == 2
+    assert any(
+        item["replay_count"] == 1
+        for item in client.get("/api/ia-tab/details").json()["data"]["items"]
+    )
+
+
+def test_ia_summary_details_filters_and_missing_data(client: TestClient) -> None:
+    db = next(app.dependency_overrides[get_session]())
+    start = datetime(2026, 10, 15, 12, tzinfo=timezone.utc)
+    session = ChatSession()
+    db.add(session)
+    db.flush()
+    for index, result in enumerate(
+        ("respond", "open_ticket", "blocked", "failed", "running", "ask_clarification")
+    ):
+        run = AgentRun(
+            session_id=session.session_id,
+            status="completed" if result not in ("failed", "running") else result,
+            final_action=result if result not in ("failed", "running") else None,
+            started_at=start + timedelta(hours=index),
+        )
+        db.add(run)
+        db.flush()
+        if index in (0, 1, 2, 4):
+            db.add(
+                AgentRunTelemetry(
+                    agent_run_id=run.agent_run_id,
+                    step_index=0,
+                    step_name="triage",
+                    model_used="measured" if index < 3 else None,
+                    timestamp_start=start + timedelta(hours=index),
+                    timestamp_end=start
+                    + timedelta(
+                        hours=index,
+                        milliseconds=(10, 20, 100)[index] if index < 3 else 0,
+                    )
+                    if index < 3
+                    else None,
+                    duration_ms=(10, 20, 100)[index] if index < 3 else None,
+                    state="complete" if index < 3 else "running",
+                )
+            )
+    db.commit()
+    db.close()
+    summary = client.get("/api/ia-tab/summary").json()["data"]
+    assert summary["total_runs"] == 6
+    assert summary["terminal_denominator"] == 3
+    assert summary["results"]["respond"]["percentage"] == pytest.approx(100 / 3)
+    assert summary["results"]["failed"]["percentage"] is None
+    assert summary["duration"] == {
+        "sample_size": 3,
+        "average_ms": pytest.approx(130 / 3),
+        "max_ms": 100,
+        "p95_ms": 100,
+        "p95_method": "nearest-rank",
+    }
+    assert summary["estimated_cost_value"] is None
+    details = client.get("/api/ia-tab/details?limit=2&offset=0").json()
+    assert details["data"]["total"] == 6
+    assert len(details["data"]["items"]) == 2
+    assert details["meta"]["limit"] == 2
+    historical = next(
+        item
+        for item in client.get("/api/ia-tab/details?limit=100").json()["data"]["items"]
+        if item["step_name"] is None
+    )
+    assert (
+        historical["tokens_input"]
+        is historical["duration_ms"]
+        is historical["attempt_count"]
+        is None
+    )
+    assert (
+        client.get(
+            "/api/ia-tab/summary?model=measured&step=triage&result=respond"
+        ).json()["data"]["total_runs"]
+        == 1
+    )
+    assert (
+        client.get("/api/ia-tab/summary?model=missing").json()["data"]["total_runs"]
+        == 0
+    )
+    assert (
+        client.get("/api/ia-tab/summary?result=running").json()["data"]["duration"][
+            "p95_ms"
+        ]
+        is None
+    )
+    assert (
+        client.get("/api/ia-tab/summary?result=running").json()["data"]["results"][
+            "respond"
+        ]["percentage"]
+        is None
+    )
+    assert (
+        client.get(
+            "/api/ia-tab/summary?start=2026-10-15T12:00:00Z&end=2026-10-15T13:00:00Z"
+        ).json()["data"]["total_runs"]
+        == 1
+    )
+    assert (
+        client.get("/api/ia-tab/summary?start=2026-10-15T12:00:00").status_code == 422
+    )
+    assert client.get("/api/ia-tab/summary?step=invalid").status_code == 422
+    assert client.get("/api/ia-tab/details?limit=101").status_code == 422
+    assert (
+        client.get("/api/ia-tab/timeseries").json()["data"]["stage_latency"]["triage"][
+            "p95_ms"
+        ]
+        == 100
+    )
+    assert client.get("/api/ia-tab/pricing-config").json()["data"]["items"] == []
+
+
+def test_ia_cost_needs_exact_valid_usd_rates_and_known_cache(
+    client: TestClient,
+) -> None:
+    db = next(app.dependency_overrides[get_session]())
+    when = datetime(2026, 10, 15, tzinfo=timezone.utc)
+    session = ChatSession()
+    db.add(session)
+    db.flush()
+    run = AgentRun(
+        session_id=session.session_id,
+        status="completed",
+        final_action="respond",
+        started_at=when,
+    )
+    db.add(run)
+    db.flush()
+    row = AgentRunTelemetry(
+        agent_run_id=run.agent_run_id,
+        step_index=0,
+        step_name="triage",
+        timestamp_start=when,
+        timestamp_end=when,
+        duration_ms=1,
+        state="complete",
+        model_used="provider-model",
+        deployment_id="deployment-1",
+        tokens_input=1000,
+        tokens_output=500,
+        tokens_cache=200,
+        cache_in_input=True,
+    )
+    db.add(row)
+    for kind, rate in (("input", 2), ("output", 10), ("cache", 0.2)):
+        db.add(
+            PricingConfigVersion(
+                model="provider-model",
+                deployment_id="deployment-1",
+                currency="USD",
+                token_type=kind,
+                rate_per_million=rate,
+                valid_from=when - timedelta(days=1),
+                active=False,
+            )
+        )
+    db.commit()
+    path = "/api/ia-tab/details"
+    assert client.get(path).json()["data"]["items"][0]["estimated_cost_value"] is None
+    for price_row in db.query(PricingConfigVersion).all():
+        price_row.active = True
+    db.commit()
+    item = client.get(path).json()["data"]["items"][0]
+    assert item["estimated_cost_value"] == pytest.approx(0.00664)
+    assert item["estimated_cost_currency"] == "USD"
+    assert len(item["pricing_config_ids"]) == 3
+    db.add(
+        AgentRun(
+            session_id=session.session_id,
+            status="completed",
+            final_action="blocked",
+            started_at=when,
+        )
+    )
+    db.commit()
+    summary = client.get("/api/ia-tab/summary").json()["data"]
+    assert summary["estimated_cost_value"] is None
+    row.cache_in_input = None
+    db.commit()
+    assert client.get(path).json()["data"]["items"][0]["estimated_cost_value"] is None
+    row.cache_in_input = True
+    for price_row in db.query(PricingConfigVersion).all():
+        price_row.valid_from = when + timedelta(days=1)
+    db.commit()
+    assert client.get(path).json()["data"]["items"][0]["estimated_cost_value"] is None
+    for price_row in db.query(PricingConfigVersion).all():
+        price_row.valid_from = when - timedelta(days=1)
+        price_row.currency = "EUR"
+    db.commit()
+    assert client.get(path).json()["data"]["items"][0]["estimated_cost_value"] is None
+    for price_row in db.query(PricingConfigVersion).all():
+        price_row.currency = "USD"
+        price_row.deployment_id = "other-deployment"
+    db.commit()
+    assert client.get(path).json()["data"]["items"][0]["estimated_cost_value"] is None
+    db.close()
+
+
+def test_ia_operational_retry_not_provider_attempt(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail(*args):
+        raise InvalidAgentOutput("Unknown category")
+
+    monkeypatch.setattr("app.main.run_workflow", fail)
+    session_id = client.post("/api/chat/sessions", json={}).json()["data"]["session_id"]
+    url = f"/api/chat/sessions/{session_id}/messages"
+    first = client.post(
+        url,
+        json={"message_text": "falha sintetica"},
+        headers={"Idempotency-Key": "one"},
+    )
+    second = client.post(
+        url,
+        json={"message_text": "falha sintetica"},
+        headers={"Idempotency-Key": "two"},
+    )
+    assert first.status_code == second.status_code == 502
+    run_id = second.json()["meta"]["agent_run_id"]
+    item = next(
+        item
+        for item in client.get("/api/ia-tab/details").json()["data"]["items"]
+        if item["agent_run_id"] == run_id
+    )
+    assert item["original_run_id"] == first.json()["meta"]["agent_run_id"]
+    assert item["retry_count"] == 1
+    assert item["attempt_count"] is None
+    assert item["replay_count"] == 0
+    assert client.get("/api/ia-tab/summary").json()["data"]["total_runs"] == 2
+
+
+def test_ia_migration_round_trip() -> None:
+    from sqlalchemy import inspect
+
+    engine = create_engine("sqlite://")
+    paths = Path(__file__).resolve().parents[1] / "migrations/versions"
+    revisions = []
+    for name in ("20261013_01_initial.py", "20261019_01_ia_telemetry.py"):
+        spec = importlib.util.spec_from_file_location(
+            name.removesuffix(".py"), paths / name
+        )
+        assert spec and spec.loader
+        revision = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(revision)
+        revisions.append(revision)
+    with engine.begin() as connection:
+        operations = Operations(MigrationContext.configure(connection))
+        for revision in revisions:
+            revision.op = operations
+            revision.upgrade()
+        assert set(inspect(connection).get_table_names()) == set(Base.metadata.tables)
+        assert "original_run_id" in {
+            col["name"] for col in inspect(connection).get_columns("agent_runs")
+        }
+        for revision in reversed(revisions):
+            revision.downgrade()
+        assert inspect(connection).get_table_names() == []
+    engine.dispose()
 
 
 @pytest.mark.parametrize(

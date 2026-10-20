@@ -3,7 +3,17 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import JSON, CheckConstraint, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -51,6 +61,76 @@ class AgentRun(Base):
     idempotency_key: Mapped[str | None] = mapped_column(String(128))
     request_hash: Mapped[str | None] = mapped_column(String(64))
     response_data: Mapped[dict | None] = mapped_column(JSON)
+    original_run_id: Mapped[str | None] = mapped_column(String(36))
+
+
+class AgentRunTelemetry(Base):
+    __tablename__ = "agent_run_telemetry"
+    __table_args__ = (UniqueConstraint("agent_run_id", "step_index"),)
+
+    telemetry_id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=new_id
+    )
+    agent_run_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_runs.agent_run_id"), index=True
+    )
+    step_index: Mapped[int]
+    step_name: Mapped[str] = mapped_column(String(32))
+    model_used: Mapped[str | None] = mapped_column(String(255))
+    deployment_id: Mapped[str | None] = mapped_column(String(255))
+    timestamp_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    timestamp_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    duration_ms: Mapped[float | None]
+    state: Mapped[str] = mapped_column(String(16))
+    tokens_input: Mapped[int | None]
+    tokens_output: Mapped[int | None]
+    tokens_cache: Mapped[int | None]
+    cache_in_input: Mapped[bool | None]
+    estimated_cost_value: Mapped[float | None] = mapped_column(Numeric(18, 8))
+    estimated_cost_currency: Mapped[str | None] = mapped_column(String(3))
+    pricing_config_id: Mapped[str | None] = mapped_column(String(36))
+
+
+class AgentRunAttempt(Base):
+    __tablename__ = "agent_run_attempts"
+
+    attempt_id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=new_id
+    )
+    agent_run_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_runs.agent_run_id"), index=True
+    )
+    step_index: Mapped[int | None]
+    attempt_type: Mapped[str] = mapped_column(String(16))
+    outcome: Mapped[str] = mapped_column(String(16))
+    observed_at: Mapped[datetime] = mapped_column(default=utc_now)
+
+
+class PricingConfigVersion(Base):
+    __tablename__ = "pricing_config_versions"
+
+    pricing_config_id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=new_id
+    )
+    model: Mapped[str] = mapped_column(String(255))
+    deployment_id: Mapped[str] = mapped_column(String(255))
+    currency: Mapped[str] = mapped_column(String(3))
+    token_type: Mapped[str] = mapped_column(String(16))
+    rate_per_million: Mapped[float] = mapped_column(Numeric(18, 8))
+    valid_from: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    valid_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    active: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(default=utc_now)
+
+
+class AgentRunResultsSummary(Base):
+    __tablename__ = "agent_run_results_summary"
+
+    agent_run_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_runs.agent_run_id"), primary_key=True
+    )
+    result: Mapped[str] = mapped_column(String(32))
+    recorded_at: Mapped[datetime] = mapped_column(default=utc_now)
 
 
 class ChatMessage(Base):

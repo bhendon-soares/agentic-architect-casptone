@@ -311,6 +311,29 @@ def test_sequential_crew_stages_validate_local_source(
             "Esqueci minha senha corporativa", 0, db, run.agent_run_id
         )
         events = db.scalars(select(AgentEvent).order_by(AgentEvent.created_at)).all()
+        from app.persistence.models import AgentRunTelemetry
+
+        telemetry = db.scalars(
+            select(AgentRunTelemetry).order_by(AgentRunTelemetry.step_index)
+        ).all()
+        from app.persistence.models import AgentRunTelemetry
+
+        telemetry = db.scalars(
+            select(AgentRunTelemetry).order_by(AgentRunTelemetry.step_index)
+        ).all()
+        assert [row.step_name for row in telemetry] == [
+            "triage",
+            "knowledge",
+            "response",
+            "policy",
+        ]
+        assert all(
+            row.state == "complete" and row.duration_ms >= 0 and row.timestamp_end
+            for row in telemetry
+        )
+        assert all(
+            row.model_used is None and row.tokens_input is None for row in telemetry
+        )
     engine.dispose()
     assert sequence == [
         "TriageInput",
@@ -413,11 +436,16 @@ def test_low_confidence_decision(
             schema = self.task.output_pydantic
             sequence.append(schema.__name__)
             if schema is crew.PolicyDecision:
-                assert "Abrir ticket ou pedir esclarecimento sem fonte e permitido" in self.task.description
+                assert (
+                    "Abrir ticket ou pedir esclarecimento sem fonte e permitido"
+                    in self.task.description
+                )
             outputs = {
                 "TriageInput": {
-                    "internal_category": "password_reset", "impact": 3,
-                    "urgency": 3, "confidence": confidence,
+                    "internal_category": "password_reset",
+                    "impact": 3,
+                    "urgency": 3,
+                    "confidence": confidence,
                     "missing_required_fields": (
                         ["impact"] if expected == "missing" else []
                     ),
@@ -437,8 +465,11 @@ def test_low_confidence_decision(
                     "veto_to_blocked": expected == "blocked",
                 },
                 "TicketPayloadDraft": {
-                    "short_description": "Falha na senha", "description": "Sem acesso",
-                    "impact": 3, "urgency": 3, "category": "inquiry",
+                    "short_description": "Falha na senha",
+                    "description": "Sem acesso",
+                    "impact": 3,
+                    "urgency": 3,
+                    "category": "inquiry",
                 },
             }
             return SimpleNamespace(
@@ -519,6 +550,15 @@ def test_crew_stage_failure_records_no_exception_text(
         with pytest.raises(error_type, match="confidential provider details"):
             crew.run_workflow("Esqueci minha senha", 0, db, run.agent_run_id)
         events = db.scalars(select(AgentEvent).order_by(AgentEvent.created_at)).all()
+        from app.persistence.models import AgentRunTelemetry
+
+        telemetry = db.scalars(
+            select(AgentRunTelemetry).order_by(AgentRunTelemetry.step_index)
+        ).all()
+        assert [row.state for row in telemetry] == ["complete", "failed"]
+        assert telemetry[1].timestamp_end is not None
+        assert telemetry[1].duration_ms >= 0
+        assert telemetry[1].tokens_input is telemetry[1].model_used is None
     engine.dispose()
     assert [(event.task_id, event.status) for event in events] == [
         ("triage", "validated"), ("knowledge", "failed")

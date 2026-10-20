@@ -1,6 +1,8 @@
 """Sequential, validated agent stages; no agent can write to ServiceNow."""
 
 import os
+import time
+from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Literal
@@ -13,7 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.knowledge.catalog import knowledge_base, sync_catalog
-from app.persistence.models import AgentEvent, KnowledgeSource
+from app.persistence.models import AgentEvent, AgentRunTelemetry, KnowledgeSource
 from app.runtime.policy import CATEGORIES, TriageResult, priority, redact
 
 CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
@@ -141,9 +143,10 @@ def run_workflow(
         ):
             raise RuntimeUnavailable("Crew configuration mismatch")
         llm_options = {"model": model, "timeout": LLM_TIMEOUT_SECONDS}
-        if model.startswith("azure/") and urlparse(
-            os.environ["AZURE_ENDPOINT"]
-        ).path.rstrip("/") == "/openai/v1":
+        if (
+            model.startswith("azure/")
+            and urlparse(os.environ["AZURE_ENDPOINT"]).path.rstrip("/") == "/openai/v1"
+        ):
             llm_options.update(
                 model=f"openai/{model.removeprefix('azure/')}",
                 base_url=os.environ["AZURE_ENDPOINT"],
@@ -167,6 +170,16 @@ def run_workflow(
             output_pydantic=schema,
             max_retry_limit=2,
         )
+        telemetry = AgentRunTelemetry(
+            agent_run_id=agent_run_id,
+            step_index=list(stages).index(role),
+            step_name=name,
+            timestamp_start=datetime.now(timezone.utc),
+            state="running",
+        )
+        db.add(telemetry)
+        db.commit()
+        started = time.perf_counter()
         try:
             result = Crew(
                 agents=[agent],
@@ -179,6 +192,7 @@ def run_workflow(
                 raise InvalidAgentOutput("Invalid structured output")
             validated = schema.model_validate(result.pydantic.model_dump())
         except Exception:
+            telemetry.state = "failed"
             db.add(
                 AgentEvent(
                     agent_run_id=agent_run_id,
@@ -188,8 +202,13 @@ def run_workflow(
                     validation_errors_redacted=[{"code": "STAGE_FAILED"}],
                 )
             )
-            db.commit()
             raise
+        else:
+            telemetry.state = "complete"
+        finally:
+            telemetry.timestamp_end = datetime.now(timezone.utc)
+            telemetry.duration_ms = max(0.0, (time.perf_counter() - started) * 1000)
+            db.commit()
         db.add(
             AgentEvent(
                 agent_run_id=agent_run_id,
