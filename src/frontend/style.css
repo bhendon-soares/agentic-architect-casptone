@@ -512,6 +512,149 @@ h2 {
   padding: 30px 0 64px;
 }
 
+.admin-tabs {
+  display: flex;
+  gap: 24px;
+  border-bottom: 1px solid var(--border);
+}
+
+.admin-tabs button {
+  background: none;
+  color: var(--muted);
+  border: 0;
+  border-bottom: 2px solid transparent;
+  padding: 10px 2px;
+  font: inherit;
+  font-size: 13px;
+}
+
+.admin-tabs button[aria-current="page"] {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+.ia-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding-top: 20px;
+}
+
+.ia-filters label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  min-width: 130px;
+  flex: 1;
+}
+
+.ia-filters input,
+.ia-filters select {
+  width: 100%;
+  min-height: 38px;
+  padding: 7px 9px;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid #41546c;
+  border-radius: 4px;
+  font: inherit;
+  color-scheme: dark;
+}
+
+.ia-metrics strong {
+  font-size: 19px;
+  overflow-wrap: anywhere;
+}
+
+.ia-charts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 32px;
+}
+
+.ia-charts section:last-child {
+  grid-column: 1 / -1;
+}
+
+.ia-bars {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 18px;
+}
+
+.ia-bar-row {
+  display: grid;
+  grid-template-columns: minmax(110px, 1fr) minmax(40px, 2fr) minmax(90px, auto);
+  gap: 10px;
+  align-items: center;
+  font-size: 12px;
+}
+
+.ia-bar-row strong {
+  text-align: right;
+}
+
+.ia-bar-track {
+  height: 9px;
+  background: var(--surface-raised);
+}
+
+.ia-bar-track div {
+  height: 100%;
+  background: var(--accent);
+}
+
+.ia-counters {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.ia-counters small {
+  display: block;
+  color: var(--muted);
+  line-height: 1.5;
+  margin-top: 7px;
+}
+
+.ia-help {
+  cursor: help;
+}
+
+.ia-table-scroll {
+  overflow-x: auto;
+}
+
+.ia-table {
+  width: 100%;
+  min-width: 1080px;
+  border-collapse: collapse;
+  font-size: 12px;
+  text-align: left;
+}
+
+.ia-table th,
+.ia-table td {
+  border-top: 1px solid var(--border);
+  padding: 12px 10px;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.ia-table th {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.ia-table td:first-child {
+  min-width: 170px;
+}
+
+.ia-table small {
+  color: var(--muted);
+}
+
 .admin-heading,
 .admin-section-heading,
 .admin-row,
@@ -834,6 +977,14 @@ h2 {
 }
 
 @media (max-width: 850px) {
+  .ia-charts {
+    display: block;
+  }
+
+  .ia-counters {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .admin-layout {
     display: flex;
     flex-direction: column;
@@ -863,6 +1014,14 @@ h2 {
 }
 
 @media (max-width: 650px) {
+  .ia-counters {
+    grid-template-columns: 1fr;
+  }
+
+  .ia-bar-row {
+    grid-template-columns: minmax(75px, 1fr) minmax(30px, 1fr) minmax(80px, auto);
+  }
+
   .topbar {
     height: 66px;
     padding: 0 18px;

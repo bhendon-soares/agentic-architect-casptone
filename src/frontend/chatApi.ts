@@ -82,6 +82,40 @@ export type AgentRun = {
     events: AgentEvent[]
 }
 
+export type IaResult = FinalAction | 'failed' | 'running'
+export type IaFilters = { start_date: string; end_date: string; model: string; step: string; result: string }
+export type IaMeasure = { value: number | null; sample_size: number }
+export type IaSummary = {
+    executions: number | null
+    available_models: string[]
+    results: Record<IaResult, number | null>
+    terminal_sample_size: number
+    result_percentages: Record<'respond' | 'open_ticket' | 'blocked', number | null>
+    estimated_cost: IaMeasure & { currency: 'USD' | null }
+    stage_mean_ms: IaMeasure
+    stage_p95_ms: IaMeasure
+    step_failures: number | null
+    observed_model_attempts: number | null
+    operational_retries: number | null
+    replays: number | null
+}
+export type IaDetail = {
+    agent_run_id: string; session_id: string | null; step_name: string; model: string | null
+    start_time: string | null; end_time: string | null; duration_ms: number | null
+    tokens_input: number | null; tokens_output: number | null; tokens_cache: number | null
+    estimated_cost_value: number | null; estimated_cost_currency: 'USD' | null
+    estimated_cost_validity_start: string | null; estimated_cost_validity_end: string | null
+    attempt_count: number | null; retry_count: number | null; replay_count: number | null
+    state: string
+}
+export type IaDetailsPage = { items: IaDetail[]; total: number }
+export type IaTimeseries = {
+    executions: { date: string; count: number | null }[]
+    results: { result: IaResult; count: number | null }[]
+    stages: { step_name: string; mean_ms: number | null; p95_ms: number | null; max_ms: number | null; sample_size: number }[]
+}
+export type IaPricingConfig = { items: { model: string; deployment_id: string; currency: string; token_type: string; rate_per_million: number; valid_from: string; valid_until: string | null }[] }
+
 type Envelope<T> = { data: T | null; error: RunError | null }
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -147,4 +181,27 @@ export function getKnowledgeSources(): Promise<{ items: KnowledgeSource[] }> {
 
 export function getAgentRun(agentRunId: string): Promise<AgentRun> {
     return request<AgentRun>(`/api/agent-runs/${encodeURIComponent(agentRunId)}`)
+}
+
+function iaQuery(filters: IaFilters): string {
+    return new URLSearchParams(Object.entries(filters).filter(([, value]) => value !== '')).toString()
+}
+
+export function getIaSummary(filters: IaFilters): Promise<IaSummary> {
+    const query = iaQuery(filters)
+    return request<IaSummary>(`/api/ia-tab/summary${query ? `?${query}` : ''}`)
+}
+
+export function getIaDetails(filters: IaFilters, limit = 20, offset = 0): Promise<IaDetailsPage> {
+    const query = new URLSearchParams({ ...Object.fromEntries(new URLSearchParams(iaQuery(filters))), limit: String(limit), offset: String(offset) })
+    return request<IaDetailsPage>(`/api/ia-tab/details?${query}`)
+}
+
+export function getIaTimeseries(filters: IaFilters): Promise<IaTimeseries> {
+    const query = iaQuery(filters)
+    return request<IaTimeseries>(`/api/ia-tab/timeseries${query ? `?${query}` : ''}`)
+}
+
+export function getIaPricingConfig(): Promise<IaPricingConfig> {
+    return request<IaPricingConfig>('/api/ia-tab/pricing-config')
 }

@@ -327,3 +327,95 @@ test('admin console keeps available data visible when another request fails', as
   expect(within(screen.getByRole('region', { name: 'Métricas' })).getByText('3')).toBeTruthy()
   expect(screen.getByText('Nenhuma conversa registrada.')).toBeTruthy()
 })
+
+const iaSummary = {
+  executions: 21,
+  available_models: ['model-a', 'model-b'],
+  results: { respond: 2, open_ticket: 1, blocked: 0, ask_clarification: 1, failed: 1, running: 1 },
+  terminal_sample_size: 3,
+  result_percentages: { respond: 66.67, open_ticket: 33.33, blocked: 0 },
+  estimated_cost: { value: null, currency: null, sample_size: 0 },
+  stage_mean_ms: { value: 120, sample_size: 2 },
+  stage_p95_ms: { value: null, sample_size: 0 },
+  step_failures: 1, observed_model_attempts: null, operational_retries: 1, replays: 0,
+}
+const iaRow = {
+  agent_run_id: 'run-ia', session_id: 'session-ia', step_name: 'triage', model: 'model-a',
+  start_time: '2026-10-15T10:00:00Z', end_time: null, duration_ms: null,
+  tokens_input: null, tokens_output: 0, tokens_cache: null, estimated_cost_value: null,
+  estimated_cost_currency: null, estimated_cost_validity_start: null, estimated_cost_validity_end: null,
+  attempt_count: null, retry_count: 1, replay_count: 0, state: 'failed',
+}
+
+function iaFetch(url: string): Promise<Response> {
+  if (url.startsWith('/api/ia-tab/summary')) return Promise.resolve(reply(iaSummary))
+  if (url.startsWith('/api/ia-tab/details?')) return Promise.resolve(reply({ items: [iaRow], total: 21 }))
+  if (url.startsWith('/api/ia-tab/timeseries')) return Promise.resolve(reply({ executions: [{ date: '2026-10-15', count: 3 }], results: [], stages: [{ step_name: 'triage', mean_ms: 120, p95_ms: null, max_ms: 160, sample_size: 2 }] }))
+  if (url === '/api/ia-tab/pricing-config') return Promise.resolve(reply({ items: [{ model: 'model-a', deployment_id: 'deploy-a', currency: 'USD', token_type: 'input', rate_per_million: 2, valid_from: '2026-10-01', valid_until: null }] }))
+  if (url === '/api/admin/conversations/session-ia') return Promise.resolve(reply({ session_id: 'session-ia', status: 'active', created_at: '2026-10-15T10:00:00Z', updated_at: '2026-10-15T10:00:00Z', messages: [], runs: [], tickets: [] }))
+  if (url === '/api/agent-runs/run-ia') return Promise.resolve(reply({ agent_run_id: 'run-ia', session_id: 'session-ia', status: 'failed', error_code: null, events: [] }))
+  if (url === '/api/metrics/summary') return Promise.resolve(reply({ total_conversations: 0, tickets_created: 0, responses_with_source: 0, blocked_requests: 0 }))
+  if (url.startsWith('/api/admin/conversations?') || url.startsWith('/api/tickets?')) return Promise.resolve(reply({ items: [], total: 0 }))
+  if (url === '/api/knowledge/sources') return Promise.resolve(reply({ items: [] }))
+  return Promise.reject(new Error(`Unexpected URL: ${url}`))
+}
+
+test('IA filters and pagination query the server and preserve null versus zero', async () => {
+  const fetchMock = vi.fn(iaFetch)
+  vi.stubGlobal('fetch', fetchMock)
+  render(<AdminConsole />)
+  fireEvent.click(screen.getByRole('button', { name: 'IA' }))
+  expect(await screen.findByRole('region', { name: 'Indicadores IA' })).toBeTruthy()
+  expect(within(screen.getByRole('region', { name: 'Indicadores IA' })).getByText('Custo estimado').parentElement?.textContent).toContain('não disponível')
+  expect(screen.getByText('Tentativas reais observadas').parentElement?.parentElement?.textContent).toContain('não disponível')
+  expect(screen.getByText('Replays').parentElement?.parentElement?.textContent).toContain('0')
+  const filters = screen.getByLabelText('Filtros IA')
+  fireEvent.change(within(filters).getByLabelText('Início'), { target: { value: '2026-10-01' } })
+  fireEvent.change(within(filters).getByLabelText('Modelo'), { target: { value: 'model-a' } })
+  fireEvent.change(within(filters).getByLabelText('Etapa'), { target: { value: 'triage' } })
+  fireEvent.change(within(filters).getByLabelText('Resultado'), { target: { value: 'failed' } })
+  expect(await screen.findByText('1–20 de 21')).toBeTruthy()
+  expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('start_date=2026-10-01&model=model-a&step=triage&result=failed'), undefined)
+  fireEvent.click(within(screen.getByRole('region', { name: 'Detalhes por execução e etapa' })).getByRole('button', { name: 'Próxima' }))
+  expect(await screen.findByText('21–21 de 21')).toBeTruthy()
+  expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/api/ia-tab/details?start_date=2026-10-01&model=model-a&step=triage&result=failed&limit=20&offset=20'), undefined)
+})
+
+test('IA details return to the existing conversation and execution views', async () => {
+  vi.stubGlobal('fetch', vi.fn(iaFetch))
+  render(<AdminConsole />)
+  fireEvent.click(screen.getByRole('button', { name: 'IA' }))
+  const table = await screen.findByRole('region', { name: 'Detalhes por execução e etapa' })
+  fireEvent.click(within(table).getByRole('button', { name: 'Ver conversa' }))
+  expect(await screen.findByText('Conversa session-ia')).toBeTruthy()
+  fireEvent.click(screen.getByRole('button', { name: 'IA' }))
+  fireEvent.click(within(await screen.findByRole('region', { name: 'Detalhes por execução e etapa' })).getByRole('button', { name: 'Ver execução' }))
+  expect(await screen.findByText('Eventos da execução')).toBeTruthy()
+})
+
+test('IA distinguishes loading, API failure with retry, empty results and missing telemetry', async () => {
+  let resolveSummary!: (response: Response) => void
+  const fetchMock = vi.fn((url: string) => {
+    if (url.startsWith('/api/ia-tab/summary') && fetchMock.mock.calls.filter(([path]) => String(path).startsWith('/api/ia-tab/summary')).length === 1) return new Promise<Response>((resolve) => { resolveSummary = resolve })
+    if (url.startsWith('/api/ia-tab/summary')) return Promise.resolve(reply({ ...iaSummary, executions: 0 }))
+    return iaFetch(url)
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  render(<AdminConsole />)
+  fireEvent.click(screen.getByRole('button', { name: 'IA' }))
+  expect(screen.getByText('Carregando telemetria…')).toBeTruthy()
+  resolveSummary(reply({ code: 'UNAVAILABLE', message: 'Indisponível', retryable: true }, 503))
+  expect(await screen.findByRole('alert')).toHaveProperty('textContent', expect.stringContaining('Não foi possível'))
+  fireEvent.click(screen.getByRole('button', { name: 'Tentar novamente' }))
+  expect(await screen.findByText('Nenhuma execução no período selecionado.')).toBeTruthy()
+})
+
+test('IA marks existing runs without cost and latency telemetry as unavailable', async () => {
+  vi.stubGlobal('fetch', vi.fn((url: string) => url.startsWith('/api/ia-tab/summary')
+    ? Promise.resolve(reply({ ...iaSummary, stage_mean_ms: { value: null, sample_size: 0 } })) : iaFetch(url)))
+  render(<AdminConsole />)
+  fireEvent.click(screen.getByRole('button', { name: 'IA' }))
+  expect(await screen.findByText(/Existem execuções, mas não há telemetria/)).toBeTruthy()
+  expect(screen.queryByText('Nenhuma execução no período selecionado.')).toBeNull()
+  expect(within(screen.getByRole('region', { name: 'Detalhes por execução e etapa' })).getByText('run-ia')).toBeTruthy()
+})
