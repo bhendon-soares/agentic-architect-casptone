@@ -9,6 +9,11 @@ type FailedTurn = { input: RunInput; key: string }
 const sessionsKey = 'support-chat-sessions'
 const reviewKey = 'support-chat-ticket-review'
 
+function ticketOutcome(ticket: RunResult['ticket']): string {
+  if (ticket?.status === 'created' && ticket.adapter_mode === 'mock') return 'Ticket simulado (não enviado)'
+  return ticket?.status === 'created' && ticket.servicenow_number ? 'Ticket aberto' : 'Estado a verificar'
+}
+
 function storedReviewSessions(): string[] {
   try {
     const value: unknown = JSON.parse(sessionStorage.getItem(reviewKey) || '[]')
@@ -102,7 +107,7 @@ export default function App() {
       markForReview(id, false)
       setMessages((current) => [...current, { id: ++nextId.current, role: 'assistant', result }])
       setDraft('')
-      setOutcomeLabel(result.final_action === 'ask_clarification' ? 'Aguardando você' : result.final_action === 'blocked' ? 'Bloqueado' : result.final_action === 'open_ticket' ? (result.ticket?.status === 'created' && result.ticket.servicenow_number ? 'Ticket aberto' : 'Estado a verificar') : 'Concluído')
+      setOutcomeLabel(result.final_action === 'ask_clarification' ? 'Aguardando você' : result.final_action === 'blocked' ? 'Bloqueado' : result.final_action === 'open_ticket' ? ticketOutcome(result.ticket) : 'Concluído')
       updateStatus('done')
     } catch (cause) {
       const failure = cause as RunError
@@ -114,7 +119,7 @@ export default function App() {
         updateStatus('done')
         return
       }
-      setOutcomeLabel(['TICKET_CREATE_FAILED', 'TICKET_OUTCOME_UNKNOWN'].includes(failure?.code) ? 'Resultado do ticket incerto' : 'Falhou')
+      setOutcomeLabel(failure?.code === 'TICKET_OUTCOME_UNKNOWN' ? 'Resultado do ticket incerto' : 'Falhou')
       setError(failure?.code && failure?.message ? failure : { code: 'RUN_FAILED', message: 'Não foi possível concluir o atendimento.', retryable: true })
       setFailedTurn({ input, key })
       setDraft(input.message_text)
@@ -131,7 +136,7 @@ export default function App() {
 
   async function reset() {
     if (running.current) return
-    if (activeSession.current && reviewSessions.includes(activeSession.current) && !window.confirm('A tentativa anterior pode ter criado um incidente. Consulte o suporte antes de solicitar outro. Iniciar uma nova conversa?')) return
+    if (activeSession.current && reviewSessions.includes(activeSession.current) && !window.confirm(error?.code === 'TICKET_CREATE_FAILED' ? 'A criação do incidente falhou. Consulte o registro local antes de solicitar outro. Iniciar uma nova conversa?' : 'A tentativa anterior pode ter criado um incidente. Consulte o suporte antes de solicitar outro. Iniciar uma nova conversa?')) return
     running.current = true
     updateStatus('running')
     try {
@@ -172,7 +177,7 @@ export default function App() {
       const lastMessage = history.messages.at(-1)
       const lastOutcome = history.outcomes?.find((outcome) => outcome.agent_run_id === lastMessage?.agent_run_id)
       const lastTurn = lastMessage?.role === 'assistant' ? history.turns.at(-1) : null
-      setOutcomeLabel(lastOutcome?.code === 'MINIMUM_TICKET_DATA_MISSING' ? 'Faltam dados mínimos para abrir o ticket' : lastTurn?.final_action === 'ask_clarification' ? 'Aguardando você' : lastTurn?.final_action === 'blocked' ? 'Bloqueado' : lastTurn?.final_action === 'open_ticket' ? (lastTurn.ticket?.status === 'created' && lastTurn.ticket.servicenow_number ? 'Ticket aberto' : 'Estado a verificar') : lastTurn?.final_action === 'respond' ? 'Concluído' : null)
+      setOutcomeLabel(lastOutcome?.code === 'MINIMUM_TICKET_DATA_MISSING' ? 'Faltam dados mínimos para abrir o ticket' : lastTurn?.final_action === 'ask_clarification' ? 'Aguardando você' : lastTurn?.final_action === 'blocked' ? 'Bloqueado' : lastTurn?.final_action === 'open_ticket' ? ticketOutcome(lastTurn.ticket) : lastTurn?.final_action === 'respond' ? 'Concluído' : null)
       updateStatus(lastTurn || lastOutcome ? 'done' : 'idle')
     } catch (cause) {
       const failure = cause as RunError
@@ -216,7 +221,7 @@ export default function App() {
               <span className="message-author">{message.role === 'user' ? 'Você' : 'Suporte TI · demonstração'}</span>
               {message.role === 'user' || message.role === 'notice' ? <p>{message.text}</p> : <>
                 <div className="answer-text"><ReactMarkdown skipHtml allowedElements={['p', 'strong', 'em', 'ul', 'ol', 'li', 'code', 'br']}>{message.result.message_pt_br}</ReactMarkdown></div>
-                {message.result.ticket && <p className="ticket-number">{message.result.ticket.status === 'created' && message.result.ticket.servicenow_number ? `Ticket aberto: ${message.result.ticket.servicenow_number}` : message.result.ticket.status === 'outcome_unknown' ? 'Resultado do ticket incerto' : message.result.ticket.status === 'failed' ? 'Abertura do ticket falhou' : 'Estado do ticket a verificar'}</p>}
+                {message.result.ticket && <p className="ticket-number">{message.result.ticket.status === 'created' && message.result.ticket.adapter_mode === 'mock' ? `Ticket simulado, não enviado ao ServiceNow: ${message.result.ticket.servicenow_number}` : message.result.ticket.status === 'created' && message.result.ticket.servicenow_number ? `Ticket aberto: ${message.result.ticket.servicenow_number}` : message.result.ticket.status === 'outcome_unknown' ? 'Resultado do ticket incerto' : message.result.ticket.status === 'failed' ? 'Abertura do ticket falhou' : 'Estado do ticket a verificar'}</p>}
                 {message.result.sources.map((source) => <aside className="source" key={source.path} aria-label="Fonte da orientação">
                   <span className="source-kicker">FONTE LOCAL</span>
                   <strong>{source.title}</strong>

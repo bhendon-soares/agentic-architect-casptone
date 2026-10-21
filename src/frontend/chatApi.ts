@@ -8,7 +8,7 @@ export type RunResult = {
     message_pt_br: string
     summary: string
     sources: { title: string; path: string; snippet: string }[]
-    ticket: { status: string; servicenow_number: string | null } | null
+    ticket: { status: string; adapter_mode?: string; servicenow_number: string | null } | null
 }
 export type ChatHistory = {
     session_id: string
@@ -42,7 +42,7 @@ export type AdminConversationDetail = {
         summary: string | null
         sources: { title: string; path: string; snippet: string }[]
     }[]
-    tickets: { ticket_id: string; agent_run_id: string; status: string; error_code: string | null; servicenow_number: string | null; created_at: string; updated_at: string }[]
+    tickets: { ticket_id: string; agent_run_id: string; status: string; adapter_mode?: string; error_code: string | null; servicenow_number: string | null; created_at: string; updated_at: string }[]
 }
 
 export type Ticket = {
@@ -50,15 +50,24 @@ export type Ticket = {
     session_id: string
     agent_run_id: string
     status: string
+    adapter_mode?: string
     servicenow_number: string | null
     internal_category: string
     resulting_priority: string | null
     created_at: string
 }
 export type TicketPage = { items: Ticket[]; total: number }
+export type SubmissionState = 'prepared' | 'attempted' | 'rejected' | 'uncertain' | 'created' | 'simulated'
+export type AdminTicket = Ticket & {
+    error_code: string | null
+    submission_state: SubmissionState
+    submission_started_at: string | null
+    redacted_payload: { short_description: string | null; description: string | null; impact: number | null; urgency: number | null; category: string | null }
+}
 export type Metrics = {
     total_conversations: number
     tickets_created: number
+    tickets_simulated?: number
     responses_with_source: number
     blocked_requests: number
 }
@@ -92,7 +101,7 @@ export type IaSummary = {
     results: Record<IaResult, number | null>
     terminal_sample_size: number
     result_percentages: Record<'respond' | 'open_ticket' | 'blocked', number | null>
-    estimated_cost: IaMeasure & { currency: 'USD' | null }
+    estimated_cost: IaMeasure & { currency: 'USD' | null; required_rows: number }
     stage_mean_ms: IaMeasure
     stage_p95_ms: IaMeasure
     step_failures: number | null
@@ -101,9 +110,9 @@ export type IaSummary = {
     replays: number | null
 }
 export type IaDetail = {
-    agent_run_id: string; session_id: string | null; step_name: string | null; model: string | null
+    agent_run_id: string; session_id: string | null; step_name: string | null; model: string | null; deployment_id?: string | null
     start_time: string | null; end_time: string | null; duration_ms: number | null
-    tokens_input: number | null; tokens_output: number | null; tokens_cache: number | null
+    tokens_input: number | null; tokens_output: number | null; tokens_cache: number | null; tokens_cache_write: number | null
     estimated_cost_value: number | null; estimated_cost_currency: 'USD' | null
     estimated_cost_validity_start: string | null; estimated_cost_validity_end: string | null
     attempt_count: number | null; retry_count: number | null; replay_count: number | null
@@ -116,8 +125,8 @@ export type IaTimeseries = {
     stages: { step_name: string; mean_ms: number | null; p95_ms: number | null; max_ms: number | null; sample_size: number }[]
 }
 export type IaPricingConfig = {
-    items: { model: string; deployment_id: string; currency: string; token_type: string; rate_per_million: number; valid_from: string; valid_until: string | null }[]
-    reference_prices?: { model: string; deployment_id: null; currency: 'USD'; token_type: string; rate_per_million: number; valid_from: null; valid_until: null; active: false }[]
+    items: { model: string; deployment_id: string; currency: string; token_type: string; rate_per_million: number; valid_from: string; valid_until: string | null; active: boolean }[]
+    reference_prices?: { model: string | null; deployment_id: string | null; currency: 'USD'; token_type: string; rate_per_million: string; valid_from: string | null; valid_until: string | null; active: false }[]
 }
 
 type Envelope<T> = { data: T | null; error: RunError | null }
@@ -125,7 +134,7 @@ type Envelope<T> = { data: T | null; error: RunError | null }
 type ApiIaSummary = {
     total_runs: number; results: Record<IaResult, { count: number; percentage: number | null }>
     terminal_denominator: number; duration: { sample_size: number; average_ms: number | null; p95_ms: number | null }
-    estimated_cost_value: number | null; estimated_cost_currency: 'USD' | null; cost_sample_size: number
+    estimated_cost_value: number | null; estimated_cost_currency: 'USD' | null; cost_sample_size: number; cost_required_rows: number
     available_models: string[]; step_failures: number | null; observed_model_attempts: number | null
     operational_retries: number | null; replays: number | null
 }
@@ -196,6 +205,10 @@ export function getKnowledgeSources(): Promise<{ items: KnowledgeSource[] }> {
     return request<{ items: KnowledgeSource[] }>('/api/knowledge/sources')
 }
 
+export function getAdminTicket(ticketId: string): Promise<AdminTicket> {
+    return request<AdminTicket>(`/api/admin/tickets/${encodeURIComponent(ticketId)}`)
+}
+
 export function getAgentRun(agentRunId: string): Promise<AgentRun> {
     return request<AgentRun>(`/api/agent-runs/${encodeURIComponent(agentRunId)}`)
 }
@@ -222,7 +235,7 @@ export function getIaSummary(filters: IaFilters): Promise<IaSummary> {
         results: Object.fromEntries(Object.entries(data.results).map(([key, value]) => [key, value.count])) as IaSummary['results'],
         terminal_sample_size: data.terminal_denominator,
         result_percentages: Object.fromEntries(['respond', 'open_ticket', 'blocked'].map((key) => [key, data.results[key as IaResult].percentage])) as IaSummary['result_percentages'],
-        estimated_cost: { value: data.estimated_cost_value, currency: data.estimated_cost_currency, sample_size: data.cost_sample_size },
+        estimated_cost: { value: data.estimated_cost_value, currency: data.estimated_cost_currency, sample_size: data.cost_sample_size, required_rows: data.cost_required_rows },
         stage_mean_ms: { value: data.duration.average_ms, sample_size: data.duration.sample_size },
         stage_p95_ms: { value: data.duration.p95_ms, sample_size: data.duration.sample_size },
         step_failures: data.step_failures,

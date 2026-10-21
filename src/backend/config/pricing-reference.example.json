@@ -1,0 +1,6 @@
+[
+  {"model": null, "deployment_id": null, "region": null, "applicability": null, "currency": "USD", "token_type": "input", "rate_per_million": "2.00", "valid_from": null, "valid_until": null, "active": false},
+  {"model": null, "deployment_id": null, "region": null, "applicability": null, "currency": "USD", "token_type": "cache", "rate_per_million": "0.20", "valid_from": null, "valid_until": null, "active": false},
+  {"model": null, "deployment_id": null, "region": null, "applicability": null, "currency": "USD", "token_type": "cache_write", "rate_per_million": "2.50", "valid_from": null, "valid_until": null, "active": false},
+  {"model": null, "deployment_id": null, "region": null, "applicability": null, "currency": "USD", "token_type": "output", "rate_per_million": "10.00", "valid_from": null, "valid_until": null, "active": false}
+]

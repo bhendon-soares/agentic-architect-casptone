@@ -164,8 +164,8 @@ def failure(
     )
 
 
-def ticket_data(ticket: Ticket) -> dict:
-    return {
+def ticket_data(ticket: Ticket, include_payload: bool = False) -> dict:
+    data = {
         name: getattr(ticket, name)
         for name in (
             "ticket_id",
@@ -180,13 +180,42 @@ def ticket_data(ticket: Ticket) -> dict:
             "resulting_priority",
             "servicenow_sys_id",
             "servicenow_number",
-            "redacted_payload",
             "error_code",
             "source_refs",
             "created_at",
             "updated_at",
         )
     }
+    if not include_payload:
+        return data
+    data.update(
+        {
+            "redacted_payload": {
+                name: ticket.redacted_payload.get(name)
+                for name in (
+                    "short_description",
+                    "description",
+                    "impact",
+                    "urgency",
+                    "category",
+                )
+            },
+            "submission_started_at": utc_iso(ticket.submission_started_at),
+            "submission_state": submission_state(ticket),
+        }
+    )
+    return data
+
+
+def submission_state(ticket: Ticket) -> str:
+    # Terminal status wins: rows created before 20261021_01 have no start time.
+    if ticket.status == "created":
+        return "simulated" if ticket.adapter_mode == "mock" else "created"
+    if ticket.status == "failed":
+        return "rejected"
+    if ticket.status == "outcome_unknown":
+        return "uncertain"
+    return "prepared" if ticket.submission_started_at is None else "attempted"
 
 
 def record_result(db: Session, run: AgentRun, result: str) -> None:
@@ -482,6 +511,8 @@ def post_message(
         )
         db.add(ticket)
         db.commit()
+        ticket.submission_started_at = datetime.now(timezone.utc)
+        db.commit()
         try:
             incident = create_incident(payload, run.agent_run_id, ticket.adapter_mode)
         except (TicketRejected, TicketOutcomeUnknown) as exc:
@@ -508,7 +539,10 @@ def post_message(
             incident.number,
         )
         result["message"] = (
-            "Abri um incidente para validacao manual pelo suporte. "
+            "Registrei um incidente simulado (modo de teste); ele nao foi enviado "
+            f"ao ServiceNow. Referencia: {incident.number}."
+            if ticket.adapter_mode == "mock"
+            else "Abri um incidente para validacao manual pelo suporte. "
             f"Numero: {incident.number}."
         )
 
@@ -523,6 +557,7 @@ def post_message(
         "ticket": {
             "ticket_id": ticket.ticket_id,
             "status": ticket.status,
+            "adapter_mode": ticket.adapter_mode,
             "servicenow_sys_id": ticket.servicenow_sys_id,
             "servicenow_number": ticket.servicenow_number,
         }
@@ -739,6 +774,7 @@ def get_admin_conversation(
                     "ticket_id": ticket.ticket_id,
                     "agent_run_id": ticket.agent_run_id,
                     "status": ticket.status,
+                    "adapter_mode": ticket.adapter_mode,
                     "error_code": ticket.error_code,
                     "servicenow_number": ticket.servicenow_number,
                     "created_at": utc_iso(ticket.created_at),
@@ -781,6 +817,19 @@ def get_ticket(
     if ticket is None:
         raise HTTPException(404, "TICKET_NOT_FOUND")
     return envelope(ticket_data(ticket), request)
+
+
+@app.get("/api/admin/tickets/{ticket_id}")
+def get_admin_ticket(
+    ticket_id: str,
+    request: Request,
+    db: Session = Depends(get_session),
+    _: None = Depends(local_admin),
+) -> dict:
+    ticket = db.get(Ticket, identifier(ticket_id))
+    if ticket is None:
+        raise HTTPException(404, "TICKET_NOT_FOUND")
+    return envelope(ticket_data(ticket, include_payload=True), request)
 
 
 @app.get("/api/agent-runs/{agent_run_id}")
@@ -833,7 +882,12 @@ def metrics(request: Request, db: Session = Depends(get_session)) -> dict:
             "tickets_created": count(
                 select(func.count())
                 .select_from(Ticket)
-                .where(Ticket.status == "created")
+                .where(Ticket.status == "created", Ticket.adapter_mode != "mock")
+            ),
+            "tickets_simulated": count(
+                select(func.count())
+                .select_from(Ticket)
+                .where(Ticket.status == "created", Ticket.adapter_mode == "mock")
             ),
             "responses_with_source": count(
                 select(func.count())

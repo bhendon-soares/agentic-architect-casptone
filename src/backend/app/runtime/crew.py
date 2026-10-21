@@ -28,6 +28,14 @@ MEMORY_ENABLED = False
 MAX_ITER = 12
 MAX_EXECUTION_SECONDS = 60
 LLM_TIMEOUT_SECONDS = 30
+IMPACT_URGENCY_SCALE = (
+    "Use a escala do ServiceNow, em que 1 e o maior valor: "
+    "impact mede a abrangencia (1 = muitos usuarios, area ou servico critico; "
+    "2 = grupo ou equipe; 3 = um unico usuario); "
+    "urgency mede quao rapido precisa ser resolvido "
+    "(1 = trabalho parado sem alternativa; 2 = trabalho degradado ou com contorno; "
+    "3 = pode aguardar)."
+)
 
 
 class ResponseDraft(BaseModel):
@@ -203,6 +211,8 @@ def run_workflow(
                 if 0 < usage.cached_prompt_tokens <= usage.prompt_tokens:
                     telemetry.tokens_cache = usage.cached_prompt_tokens
                     telemetry.cache_in_input = True
+                if usage.cache_creation_tokens > 0:
+                    telemetry.tokens_cache_write = usage.cache_creation_tokens
             if result.pydantic is None:
                 raise InvalidAgentOutput("Invalid structured output")
             validated = schema.model_validate(result.pydantic.model_dump())
@@ -241,7 +251,8 @@ def run_workflow(
         "Classificar e priorizar com seguranca",
         f"Classifique o relato redigido: {message}. "
         f"Escolha internal_category entre {list(CATEGORIES)}. "
-        "Indique impact, urgency, confidence, risk_flags e missing_required_fields.",
+        "Indique impact, urgency, confidence, risk_flags e missing_required_fields. "
+        f"{IMPACT_URGENCY_SCALE}",
         TriageInput,
     )
     if triage_input.internal_category not in CATEGORIES:

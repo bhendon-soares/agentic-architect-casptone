@@ -1229,7 +1229,8 @@ a {
   font-size: 13px;
 }
 
-.admin-event pre {
+.admin-event pre,
+.admin-history pre {
   background: var(--surface);
   padding: 12px;
   overflow-x: auto;

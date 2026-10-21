@@ -72,6 +72,17 @@ test.each([
   if (finalAction === 'respond') expect(screen.getByRole('complementary', { name: 'Fonte da orientação' })).toBeTruthy()
 })
 
+test('mock ticket is shown as simulated and never as opened or sent', async () => {
+  const fetchMock = vi.fn().mockResolvedValueOnce(reply({ session_id: 'session-1' }))
+    .mockResolvedValueOnce(reply({ ...turn, final_action: 'open_ticket', message_pt_br: 'Registrei um incidente simulado (modo de teste); ele nao foi enviado ao ServiceNow. Referencia: MOCK-1.', ticket: { servicenow_number: 'MOCK-1', status: 'created', adapter_mode: 'mock' }, sources: [] }))
+  vi.stubGlobal('fetch', fetchMock)
+  render(<App />)
+  submitMessage()
+  expect(await screen.findByText('Ticket simulado, não enviado ao ServiceNow: MOCK-1')).toBeTruthy()
+  expect(screen.getByText('Atendimento: Ticket simulado (não enviado)')).toBeTruthy()
+  expect(screen.queryByText(/Ticket aberto/)).toBeNull()
+})
+
 test('shows progress without a lost-key warning while a message is in flight', async () => {
   let resolveTurn!: (response: Response) => void
   const fetchMock = vi.fn().mockResolvedValueOnce(reply({ session_id: 'session-1' }))
@@ -176,6 +187,7 @@ test.each(['TICKET_CREATE_FAILED', 'TICKET_OUTCOME_UNKNOWN'])('prevents a new PO
   render(<App />)
   submitMessage()
   expect(await screen.findByRole('alert')).toHaveProperty('textContent', expect.stringContaining('Consulte o suporte'))
+  expect(screen.getByText(`Atendimento: ${code === 'TICKET_CREATE_FAILED' ? 'Falhou' : 'Resultado do ticket incerto'}`).classList.contains(code === 'TICKET_CREATE_FAILED' ? 'danger' : 'warning')).toBe(true)
   fireEvent.change(screen.getByRole('textbox', { name: 'Descreva seu problema' }), { target: { value: 'Outro texto' } })
   expect(screen.getByRole('button', { name: 'Enviar' }).hasAttribute('disabled')).toBe(true)
   fireEvent.click(screen.getByRole('button', { name: 'Enviar' }))
@@ -349,7 +361,7 @@ const iaSummary = {
   available_models: ['model-a', 'model-b'],
   results: { respond: { count: 2, percentage: 66.67 }, open_ticket: { count: 1, percentage: 33.33 }, blocked: { count: 0, percentage: 0 }, ask_clarification: { count: 1, percentage: null }, failed: { count: 1, percentage: null }, running: { count: 1, percentage: null } },
   terminal_denominator: 3,
-  estimated_cost_value: null, estimated_cost_currency: null, cost_sample_size: 0,
+  estimated_cost_value: null, estimated_cost_currency: null, cost_sample_size: 0, cost_required_rows: 1,
   duration: { average_ms: 120, p95_ms: null, sample_size: 2 },
   step_failures: 1, observed_model_attempts: null, operational_retries: 1, replays: 0,
 }
@@ -467,6 +479,31 @@ test('IA masks p95 and maximum for a small sample without hiding its mean', asyn
   expect(screen.getByRole('region', { name: 'Latência por etapa' }).textContent).toContain('120 ms · amostra insuficiente · amostra insuficiente')
 })
 
+test('IA shows server-estimated cost and sample separately from reference prices', async () => {
+  const row = { ...iaRow, state: 'complete', deployment_id: 'deployment-a', tokens_input: 40, tokens_output: 0, tokens_cache: 0, tokens_cache_write: 0, estimated_cost_value: 0.00008, estimated_cost_currency: 'USD', estimated_cost_validity_start: '2026-10-01T00:00:00Z' }
+  vi.stubGlobal('fetch', vi.fn((url: string) => url.startsWith('/api/ia-tab/summary')
+    ? Promise.resolve(reply({ ...iaSummary, estimated_cost_value: 0.00008, estimated_cost_currency: 'USD', cost_sample_size: 1 }))
+    : url.startsWith('/api/ia-tab/details?') ? Promise.resolve(reply({ items: [row], total: 1 })) : iaFetch(url)))
+  render(<AdminConsole />)
+  fireEvent.click(screen.getByRole('button', { name: 'IA' }))
+  const table = await screen.findByRole('region', { name: 'Detalhes por execução e etapa' })
+  expect(table.textContent).toContain('USD 0,00008 (estimativa)')
+  expect(table.textContent).toContain('Etapa · amostra 1 · USD')
+  expect(screen.getByText(/Amostras: custo 1 de 1 etapas/)).toBeTruthy()
+  expect(screen.getByText('Tarifas de referência (não são custo medido)')).toBeTruthy()
+})
+
+test('IA explains missing cost and uses dashes for null without erasing measured zero', async () => {
+  vi.stubGlobal('fetch', vi.fn(iaFetch))
+  render(<AdminConsole />)
+  fireEvent.click(screen.getByRole('button', { name: 'IA' }))
+  const table = await screen.findByRole('region', { name: 'Detalhes por execução e etapa' })
+  expect(table.textContent).toContain('— / 0 / — / —')
+  expect(table.textContent).toContain('— / 1 / 0')
+  expect(table.textContent).toContain('Etapa não concluída')
+  expect(screen.getByText(/Cobertura incompleta: 0 de 1 etapas/)).toBeTruthy()
+})
+
 test('event timeline shows a decision only from its recorded payload', async () => {
   const fetchMock = vi.fn((url: string) => {
     if (url === '/api/agent-runs/run-1') return Promise.resolve(reply({
@@ -487,5 +524,56 @@ test('event timeline shows a decision only from its recorded payload', async () 
   const events = await screen.findByText('backend · triage')
   expect(events.parentElement?.textContent).not.toContain('Desfecho:')
   expect(screen.getByText('Desfecho: Resposta')).toBeTruthy()
-  expect(screen.getAllByText('Ver payload')).toHaveLength(2)
+  expect(screen.getAllByText('Ver metadados da etapa')).toHaveLength(2)
+})
+
+test.each([
+  ['prepared', null, 'Apenas preparado, não enviado'],
+  ['uncertain', '2026-10-15T10:00:00Z', 'Resultado do envio incerto'],
+  ['created', '2026-10-15T10:00:00Z', 'Enviado e criado'],
+  ['created', null, 'Enviado e criado'],
+  ['rejected', '2026-10-15T10:00:00Z', 'Envio rejeitado'],
+  ['simulated', '2026-10-15T10:00:00Z', 'Simulado (mock), não enviado ao ServiceNow'],
+])('admin ticket detail renders redacted payload and %s submission separately from events', async (submission_state, submission_started_at, label) => {
+  const fetchMock = vi.fn((url: string) => {
+    if (url === '/api/tickets?limit=20&offset=0') return Promise.resolve(reply({ items: [{ ticket_id: 'ticket-1', session_id: 'session-1', agent_run_id: 'run-1', status: submission_state === 'uncertain' ? 'outcome_unknown' : submission_state === 'rejected' ? 'failed' : ['created', 'simulated'].includes(submission_state) ? 'created' : 'pending', adapter_mode: submission_state === 'simulated' ? 'mock' : 'servicenow', servicenow_number: submission_state === 'simulated' ? 'MOCK-1' : null, internal_category: 'password_reset', resulting_priority: null, created_at: null }], total: 1 }))
+    if (url === '/api/admin/tickets/ticket-1') return Promise.resolve(reply({ ticket_id: 'ticket-1', servicenow_number: null, submission_state, submission_started_at, error_code: null, redacted_payload: { short_description: 'Incidente redigido', description: '[REDACTED]', impact: 3, urgency: 2, category: 'inquiry' } }))
+    if (url === '/api/agent-runs/run-1') return Promise.resolve(reply({ agent_run_id: 'run-1', status: submission_state, events: [{ event_id: 'decision-1', producer: 'backend', task_id: 'decision', status: 'completed', created_at: null, payload: { final_action: 'open_ticket' }, validation_errors: [] }] }))
+    return iaFetch(url)
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  render(<AdminConsole />)
+  fireEvent.click(screen.getByRole('button', { name: 'Tickets' }))
+  if (submission_state === 'simulated') expect(await screen.findByText('Simulado (não enviado)')).toBeTruthy()
+  fireEvent.click(await screen.findByRole('button', { name: 'Ver ticket' }))
+  const ticket = await screen.findByRole('region', { name: 'Detalhe do ticket' })
+  expect(within(ticket).getByText(label)).toBeTruthy()
+  expect(ticket.textContent).toContain(submission_started_at ? 'Início do envio:' : submission_state === 'prepared' ? 'Início do envio: não iniciado' : 'Início do envio: não registrado')
+  expect(ticket.textContent).toContain('[REDACTED]')
+  expect(ticket.textContent).not.toContain('final_action')
+  expect(screen.queryByText('Selecione uma conversa ou um ticket para ver o histórico.')).toBeNull()
+  fireEvent.click(screen.getByRole('button', { name: 'Ver eventos' }))
+  const event = (await screen.findByText('backend · decision')).parentElement!
+  fireEvent.click(within(event).getByText('Ver metadados da etapa'))
+  expect(event.textContent).toContain('final_action')
+  expect(event.textContent).not.toContain('validation_errors')
+  expect(event.textContent).not.toContain('[]')
+  expect(fetchMock).toHaveBeenCalledWith('/api/admin/tickets/ticket-1', undefined)
+  expect(ticket.textContent).not.toContain(submission_state === 'simulated' ? 'Enviado e criado' : 'Simulado')
+})
+
+test('admin conversation and execution keep an unknown ticket out of success states', async () => {
+  vi.stubGlobal('fetch', vi.fn((url: string) => {
+    if (url === '/api/admin/conversations?limit=20&offset=0') return Promise.resolve(reply({ items: [{ session_id: 'session-1', last_activity_at: null, status: 'active', last_run: { run_status: 'outcome_unknown', final_action: 'open_ticket', error_code: 'TICKET_OUTCOME_UNKNOWN' } }], total: 1 }))
+    if (url === '/api/admin/conversations/session-1') return Promise.resolve(reply({ session_id: 'session-1', status: 'active', created_at: null, updated_at: null, messages: [], runs: [{ agent_run_id: 'run-1', status: 'outcome_unknown', final_action: 'open_ticket', started_at: null, summary: null, error_code: 'TICKET_OUTCOME_UNKNOWN', sources: [] }], tickets: [] }))
+    return iaFetch(url)
+  }))
+  render(<AdminConsole />)
+  fireEvent.click(screen.getByRole('button', { name: 'Conversas' }))
+  const list = await screen.findByRole('region', { name: 'Conversas' })
+  expect(within(list).getByText('Resultado incerto').classList.contains('warning')).toBe(true)
+  fireEvent.click(within(list).getByRole('button', { name: 'Ver detalhes' }))
+  const detail = screen.getByRole('region', { name: 'Conversa e decisões' })
+  expect((await within(detail).findByText('Resultado incerto')).classList.contains('warning')).toBe(true)
+  expect(within(detail).queryByText('Ticket')).toBeNull()
 })

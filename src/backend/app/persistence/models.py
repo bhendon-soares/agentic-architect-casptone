@@ -85,6 +85,7 @@ class AgentRunTelemetry(Base):
     tokens_input: Mapped[int | None]
     tokens_output: Mapped[int | None]
     tokens_cache: Mapped[int | None]
+    tokens_cache_write: Mapped[int | None]
     cache_in_input: Mapped[bool | None]
     estimated_cost_value: Mapped[float | None] = mapped_column(Numeric(18, 8))
     estimated_cost_currency: Mapped[str | None] = mapped_column(String(3))
@@ -195,6 +196,9 @@ class Ticket(Base):
     urgency: Mapped[int]
     resulting_priority: Mapped[str] = mapped_column(String(2))
     redacted_payload: Mapped[dict] = mapped_column(JSON)
+    submission_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     source_refs: Mapped[list] = mapped_column(JSON, default=list)
     servicenow_sys_id: Mapped[str | None] = mapped_column(String(64))
     servicenow_number: Mapped[str | None] = mapped_column(String(64))

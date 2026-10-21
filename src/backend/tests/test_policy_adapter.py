@@ -82,7 +82,7 @@ def test_block_and_redact() -> None:
 
 def test_redact_bearer_and_quoted_client_secret() -> None:
     result = redact(
-        'Authorization: Bearer eyJhbGciOiJ9.payload.signature, '
+        "Authorization: Bearer eyJhbGciOiJ9.payload.signature, "
         '"client_secret": "synthetic-secret-value"'
     )
     assert "eyJhbGciOiJ9" not in result
@@ -275,7 +275,9 @@ def test_sequential_crew_stages_validate_local_source(
 ) -> None:
     monkeypatch.setenv("LLM_MODEL", "azure/demo" if foundry else "test-model")
     if foundry:
-        monkeypatch.setenv("AZURE_ENDPOINT", "https://demo.services.ai.azure.com/openai/v1/")
+        monkeypatch.setenv(
+            "AZURE_ENDPOINT", "https://demo.services.ai.azure.com/openai/v1/"
+        )
         monkeypatch.setenv("AZURE_API_KEY", "synthetic-key")
     monkeypatch.setenv(
         "KNOWLEDGE_BASE_PATH", str(Path(__file__).resolve().parents[3] / "knowledge")
@@ -302,6 +304,9 @@ def test_sequential_crew_stages_validate_local_source(
             self.task = kwargs["tasks"][0]
             if self.task.output_pydantic is crew.TriageInput:
                 assert str(list(crew.CATEGORIES)) in self.task.description
+                assert crew.IMPACT_URGENCY_SCALE in self.task.description
+                assert "3 = um unico usuario" in crew.IMPACT_URGENCY_SCALE
+                assert "1 = trabalho parado" in crew.IMPACT_URGENCY_SCALE
 
         def kickoff(self):
             schema = self.task.output_pydantic
@@ -338,7 +343,9 @@ def test_sequential_crew_stages_validate_local_source(
                     completion_tokens=30,
                     cached_prompt_tokens=cached_tokens,
                     successful_requests=1,
-                ) if has_usage else UsageMetrics(),
+                )
+                if has_usage
+                else UsageMetrics(),
             )
 
     monkeypatch.setattr(crew, "Crew", FakeCrew)
@@ -380,8 +387,12 @@ def test_sequential_crew_stages_validate_local_source(
             and row.tokens_output == (30 if has_usage else None)
             and row.tokens_cache == expected_cache
             and row.cache_in_input == (True if has_usage and cached_tokens else None)
+            and row.deployment_id is None
             for row in telemetry
         )
+        from app.persistence.models import AgentRunAttempt
+
+        assert db.query(AgentRunAttempt).count() == 0
     engine.dispose()
     assert sequence == [
         "TriageInput",
@@ -396,7 +407,10 @@ def test_sequential_crew_stages_validate_local_source(
     assert "synthetic-secret" not in str(result)
     assert result["sources"][0]["path"] == source_path
     assert [event.task_id for event in events] == [
-        "triage", "knowledge", "response", "policy"
+        "triage",
+        "knowledge",
+        "response",
+        "policy",
     ]
     assert all(event.status == "validated" for event in events)
     assert all(set(event.payload_redacted) == {"output_schema"} for event in events)
@@ -427,7 +441,10 @@ def test_live_crew_stages_with_synthetic_request(message: str) -> None:
         db.commit()
         try:
             result = crew.run_workflow(
-                message, 0, db, run.agent_run_id,
+                message,
+                0,
+                db,
+                run.agent_run_id,
             )
         finally:
             events = db.scalars(
@@ -438,10 +455,16 @@ def test_live_crew_stages_with_synthetic_request(message: str) -> None:
                 [(event.task_id, event.status) for event in events],
             )
         assert [event.task_id for event in events[:4]] == [
-            "triage", "knowledge", "response", "policy"
+            "triage",
+            "knowledge",
+            "response",
+            "policy",
         ]
         assert result["action"] in (
-            "respond", "ask_clarification", "open_ticket", "blocked"
+            "respond",
+            "ask_clarification",
+            "open_ticket",
+            "blocked",
         )
         assert all(event.payload_redacted.get("output_schema") for event in events)
         print("Live action:", result["action"])
@@ -557,7 +580,8 @@ def test_low_confidence_decision(
 
 @pytest.mark.parametrize("error_type", [RuntimeError, TimeoutError])
 def test_crew_stage_failure_records_no_exception_text(
-    monkeypatch: pytest.MonkeyPatch, error_type: type[Exception],
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
 ) -> None:
     monkeypatch.setenv("LLM_MODEL", "test-model")
     monkeypatch.setenv(
@@ -610,7 +634,8 @@ def test_crew_stage_failure_records_no_exception_text(
         assert telemetry[1].model_used == "test-model"
     engine.dispose()
     assert [(event.task_id, event.status) for event in events] == [
-        ("triage", "validated"), ("knowledge", "failed")
+        ("triage", "validated"),
+        ("knowledge", "failed"),
     ]
     assert events[1].validation_errors_redacted == [{"code": "STAGE_FAILED"}]
     assert "confidential" not in str(events[1].payload_redacted)

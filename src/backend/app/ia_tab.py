@@ -1,11 +1,15 @@
 """Local-only IA reporting over trusted stage measurements."""
 
+import json
+import os
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from decimal import Decimal
 from math import ceil
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -27,12 +31,56 @@ RESULTS = (
     "running",
 )
 STEPS = ("triage", "knowledge", "response", "policy", "ticketing")
-REFERENCE_RATES = (
-    ("input", 2.00),
-    ("cache", 0.20),
-    ("cache_write", 2.50),
-    ("output", 10.00),
-)
+
+
+class ReferencePrice(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    model: str | None
+    deployment_id: str | None
+    region: str | None
+    applicability: str | None
+    currency: str
+    token_type: str
+    rate_per_million: Decimal
+    valid_from: datetime | None
+    valid_until: datetime | None
+    active: bool
+
+    @field_validator("currency")
+    @classmethod
+    def usd_only(cls, value: str) -> str:
+        if value != "USD":
+            raise ValueError("USD required")
+        return value
+
+    @field_validator("active")
+    @classmethod
+    def reference_inactive(cls, value: bool) -> bool:
+        if value:
+            raise ValueError("reference cannot be active")
+        return value
+
+    @field_validator("rate_per_million")
+    @classmethod
+    def nonnegative_rate(cls, value: Decimal) -> Decimal:
+        if not value.is_finite() or value < 0:
+            raise ValueError("invalid rate")
+        return value
+
+
+def reference_prices() -> list[dict]:
+    path = os.getenv("PRICING_REFERENCE_PATH")
+    if not path:
+        return []
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(raw, list):
+            raise ValueError("invalid pricing reference")
+        return [
+            ReferencePrice.model_validate(item).model_dump(mode="json") for item in raw
+        ]
+    except (OSError, ValueError, ValidationError) as exc:
+        raise HTTPException(503, "PRICING_REFERENCE_UNAVAILABLE") from exc
 
 
 def iso(value: datetime | None) -> str | None:
@@ -120,10 +168,17 @@ def price(
         or row.tokens_input is None
         or row.tokens_output is None
         or row.tokens_cache is None
-        or row.cache_in_input is None
+        or row.tokens_cache_write is None
+        or row.cache_in_input is not True
         or row.state != "complete"
         or row.tokens_cache > row.tokens_input
-        or min(row.tokens_input, row.tokens_output, row.tokens_cache) < 0
+        or min(
+            row.tokens_input,
+            row.tokens_output,
+            row.tokens_cache,
+            row.tokens_cache_write,
+        )
+        < 0
     ):
         return None, []
     configs = db.scalars(
@@ -144,15 +199,18 @@ def price(
     by_type = defaultdict(list)
     for item in applicable:
         by_type[item.token_type].append(item)
-    required = ("input", "output", "cache") if row.tokens_cache else ("input", "output")
+    required = ["input", "output"]
+    if row.tokens_cache:
+        required.append("cache")
+    if row.tokens_cache_write:
+        required.append("cache_write")
     if any(len(by_type[kind]) != 1 for kind in required):
-        return None, []
-    if row.tokens_cache and not row.cache_in_input:
         return None, []
     tokens = {
         "input": row.tokens_input - row.tokens_cache,
         "output": row.tokens_output,
         "cache": row.tokens_cache,
+        "cache_write": row.tokens_cache_write,
     }
     chosen = [by_type[kind][0] for kind in required]
     return sum(
@@ -195,6 +253,7 @@ def detail(
         "tokens_input": row.tokens_input if row else None,
         "tokens_output": row.tokens_output if row else None,
         "tokens_cache": row.tokens_cache if row else None,
+        "tokens_cache_write": row.tokens_cache_write if row else None,
         "estimated_cost_value": float(cost) if cost is not None else None,
         "estimated_cost_currency": "USD" if cost is not None else None,
         "estimated_cost_validity_start": iso(max(item.valid_from for item in configs))
@@ -299,7 +358,8 @@ def summary(
     attempt_counts = Counter(
         attempt.attempt_type
         for attempt in attempts
-        if not criteria["step"] and not criteria["model"]
+        if not criteria["step"]
+        and not criteria["model"]
         or attempt.step_index is None
         or (attempt.agent_run_id, attempt.step_index) in selected_steps
     )
@@ -415,9 +475,7 @@ def pricing_config(request: Request, db: Session = Depends(get_session)) -> dict
     from app.main import envelope
 
     rows = db.scalars(
-        select(PricingConfigVersion)
-        .where(PricingConfigVersion.active.is_(True))
-        .order_by(
+        select(PricingConfigVersion).order_by(
             PricingConfigVersion.model,
             PricingConfigVersion.deployment_id,
             PricingConfigVersion.token_type,
@@ -436,22 +494,11 @@ def pricing_config(request: Request, db: Session = Depends(get_session)) -> dict
                     "rate_per_million": float(row.rate_per_million),
                     "valid_from": iso(row.valid_from),
                     "valid_until": iso(row.valid_until),
+                    "active": row.active,
                 }
                 for row in rows
             ],
-            "reference_prices": [
-                {
-                    "model": "gpt-6-sol",
-                    "deployment_id": None,
-                    "currency": "USD",
-                    "token_type": token_type,
-                    "rate_per_million": rate,
-                    "valid_from": None,
-                    "valid_until": None,
-                    "active": False,
-                }
-                for token_type, rate in REFERENCE_RATES
-            ],
+            "reference_prices": reference_prices(),
         },
         request,
     )

@@ -18,6 +18,19 @@ function available(value: number | null | undefined, unit = ''): string {
     return value == null ? 'não disponível' : `${formatNumber(value)}${unit}`
 }
 
+function cell(value: number | null | undefined): string {
+    return value == null ? '—' : formatNumber(value)
+}
+
+function costReason(item: IaDetailsPage['items'][number]): string {
+    if (item.estimated_cost_value != null) return `Etapa · amostra 1 · ${item.estimated_cost_currency ?? 'USD'}`
+    if (item.state !== 'complete') return 'Etapa não concluída'
+    if (!item.model) return 'Modelo não registrado'
+    if (!item.deployment_id) return 'Deployment não registrado'
+    if ([item.tokens_input, item.tokens_output, item.tokens_cache, item.tokens_cache_write].some((value) => value == null)) return 'Tokens não medidos'
+    return 'Sem tarifa ativa correspondente'
+}
+
 function Bars({ values, unit = '' }: { values: { label: string; value: number | null }[]; unit?: string }) {
     const max = Math.max(0, ...values.map(({ value }) => value ?? 0))
     return <div className="ia-bars">{values.map(({ label, value }) => <div className="ia-bar-row" key={label}>
@@ -34,6 +47,7 @@ export default function IaPanel({ onConversation, onRun }: { onConversation: (id
     const [details, setDetails] = useState<IaDetailsPage | null>(null)
     const [series, setSeries] = useState<IaTimeseries | null>(null)
     const [pricing, setPricing] = useState<IaPricingConfig | null>(null)
+    const [pricingError, setPricingError] = useState(false)
     const [loading, setLoading] = useState(true)
     const [error, setError] = useState<string | null>(null)
 
@@ -41,13 +55,16 @@ export default function IaPanel({ onConversation, onRun }: { onConversation: (id
         let active = true
         setLoading(true)
         setError(null)
-        Promise.all([getIaSummary(filters), getIaDetails(filters, pageSize, offset), getIaTimeseries(filters), getIaPricingConfig()])
+        setPricingError(false)
+        const pricingRequest = getIaPricingConfig().catch(() => null)
+        Promise.all([getIaSummary(filters), getIaDetails(filters, pageSize, offset), getIaTimeseries(filters), pricingRequest])
             .then(([nextSummary, nextDetails, nextSeries, nextPricing]) => {
                 if (!active) return
                 setSummary(nextSummary)
                 setDetails(nextDetails)
                 setSeries(nextSeries)
                 setPricing(nextPricing)
+                setPricingError(nextPricing == null)
             })
             .catch(() => { if (active) setError('Não foi possível carregar a telemetria da IA.') })
             .finally(() => { if (active) setLoading(false) })
@@ -83,6 +100,7 @@ export default function IaPanel({ onConversation, onRun }: { onConversation: (id
         {!loading && !error && <AvisoDeLacuna notices={[
             ...(missingTelemetry ? [{ type: 'telemetry', text: 'Existem execuções, mas não há telemetria de custo ou latência disponível.' }] : []),
             ...(summary && summary.stage_p95_ms.sample_size > 0 && summary.stage_p95_ms.sample_size < 20 ? [{ type: 'sample', text: 'p95 e máximo ocultos para amostras menores que 20 etapas.' }] : []),
+            ...(pricingError ? [{ type: 'pricing', text: 'Configuração de tarifas indisponível; o custo exibido vem apenas do servidor.' }] : []),
             ...(details && details.total > details.items.length ? [{ type: 'page', text: 'Os registros abaixo são apenas a página carregada; não representam o total global.' }] : []),
         ]} />}
         {!loading && !error && summary && series && details && !noRuns && <>
@@ -94,7 +112,7 @@ export default function IaPanel({ onConversation, onRun }: { onConversation: (id
                     ['p95 de etapa (nearest-rank)', summary.stage_p95_ms.sample_size === 0 ? 'não disponível' : summary.stage_p95_ms.sample_size >= 20 ? formatDuration(summary.stage_p95_ms.value) : 'amostra insuficiente'],
                 ].map(([label, value]) => <KpiCard key={label} label={label} value={value} definition="Valor agregado retornado pelo servidor para os filtros selecionados." />)}
             </section>
-            <p className="admin-muted">Amostras: custo {summary.estimated_cost.sample_size}; latência média {summary.stage_mean_ms.sample_size}; p95 {summary.stage_p95_ms.sample_size} etapas concluídas.{summary.estimated_cost.value != null && summary.estimated_cost.currency === 'USD' ? ' Custo em USD é estimativa.' : ''}</p>
+            <p className="admin-muted">{summary.estimated_cost.sample_size >= summary.estimated_cost.required_rows ? `Amostras: custo ${summary.estimated_cost.sample_size} de ${summary.estimated_cost.required_rows} etapas` : `Cobertura incompleta: ${summary.estimated_cost.sample_size} de ${summary.estimated_cost.required_rows} etapas com custo calculável`}; latência média {summary.stage_mean_ms.sample_size}; p95 {summary.stage_p95_ms.sample_size} etapas concluídas.{summary.estimated_cost.value != null && summary.estimated_cost.currency === 'USD' ? ' Custo em USD é estimativa.' : ''}</p>
             <div className="ia-charts">
                 <section className="admin-section" aria-label="Evolução de execuções"><div className="admin-section-heading"><h2>Evolução de execuções</h2><span>execuções / dia</span></div>
                     {series.executions.length ? <Bars values={series.executions.map((point) => ({ label: point.date, value: point.count }))} /> : <p className="admin-muted">Série temporal não disponível.</p>}</section>
@@ -114,20 +132,20 @@ export default function IaPanel({ onConversation, onRun }: { onConversation: (id
                 ].map(([label, value, description]) => <div key={label} className="admin-metric"><span>{label} <span className="ia-help" tabIndex={0} title={String(description)} aria-label={String(description)}>ⓘ</span></span><strong>{available(value as number | null)}</strong><small>{description}</small></div>)}
             </div></section>
             <section className="admin-section" aria-label="Detalhes por execução e etapa"><div className="admin-section-heading"><h2>Execuções e etapas</h2><span>{details.total} registros · {period}</span></div>
-                {details.items.length === 0 ? <p className="admin-muted">Nenhuma etapa encontrada para estes filtros.</p> : <div className="ia-table-scroll"><table className="ia-table"><thead><tr><th>Execução / etapa</th><th>Modelo / estado</th><th>Início / fim</th><th>Duração</th><th>Tokens entrada / saída / cache</th><th>Custo estimado</th><th>Tentativas / retentativas / replays</th></tr></thead><tbody>
+                {details.items.length === 0 ? <p className="admin-muted">Nenhuma etapa encontrada para estes filtros.</p> : <div className="ia-table-scroll"><table className="ia-table"><thead><tr><th>Execução / etapa</th><th>Modelo / estado</th><th>Início / fim</th><th>Duração</th><th>Tokens entrada / saída / leitura / escrita de cache</th><th>Custo estimado</th><th>Tentativas / retentativas / replays</th></tr></thead><tbody>
                     {details.items.map((item, index) => <tr key={`${item.agent_run_id}-${item.step_name}-${index}`}><td><strong><IdChip id={item.agent_run_id} /></strong><br />{item.step_name}<br />
                         {item.session_id && <button type="button" className="admin-text-button" onClick={() => onConversation(item.session_id!)}>Ver conversa</button>}{' '}<button type="button" className="admin-text-button" onClick={() => onRun(item.agent_run_id)}>Ver execução</button></td>
                         <td>{item.model ?? 'não disponível'}<br />{item.state}</td><td>{formatDate(item.start_time)}<br />{formatDate(item.end_time)}</td><td>{formatDuration(item.duration_ms)}</td>
-                        <td>{[item.tokens_input, item.tokens_output, item.tokens_cache].map((value) => available(value)).join(' / ')}</td>
-                        <td>{formatCurrency(item.estimated_cost_value, item.estimated_cost_currency)}<br /><small>Tarifa: {formatDate(item.estimated_cost_validity_start)} a {formatDate(item.estimated_cost_validity_end)}</small></td>
-                        <td>{[item.attempt_count, item.retry_count, item.replay_count].map((value) => available(value)).join(' / ')}</td></tr>)}
+                        <td>{[item.tokens_input, item.tokens_output, item.tokens_cache, item.tokens_cache_write].map(cell).join(' / ')}</td>
+                        <td>{formatCurrency(item.estimated_cost_value, item.estimated_cost_currency)}<br /><small>{costReason(item)}</small>{item.estimated_cost_value != null && <><br /><small>Tarifa: {formatDate(item.estimated_cost_validity_start)} a {formatDate(item.estimated_cost_validity_end)}</small></>}</td>
+                        <td>{[item.attempt_count, item.retry_count, item.replay_count].map(cell).join(' / ')}</td></tr>)}
                 </tbody></table></div>}
                 {details.total > pageSize && <div className="admin-pagination"><button type="button" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - pageSize))}>Anterior</button><span>{offset + 1}–{Math.min(offset + pageSize, details.total)} de {details.total}</span><button type="button" disabled={offset + pageSize >= details.total} onClick={() => setOffset(offset + pageSize)}>Próxima</button></div>}
             </section>
         </>}
         {!loading && !error && referencePrices.length > 0 && <details className="admin-section ia-pricing"><summary>Tarifas de referência (não são custo medido)</summary>
             <div className="admin-section-heading"><h2>Preços de referência</h2><span>USD / 1 milhão de tokens</span></div>
-            {referencePrices.map((item) => <div className="admin-row" key={item.token_type}><strong>{tokenLabels[item.token_type] ?? item.token_type}</strong><span>US$ {item.rate_per_million.toFixed(2).replace('.', ',')}</span></div>)}
+            {referencePrices.map((item) => <div className="admin-row" key={item.token_type}><strong>{tokenLabels[item.token_type] ?? item.token_type}</strong><span>US$ {Number(item.rate_per_million).toFixed(2).replace('.', ',')}</span></div>)}
             <p className="admin-muted">Valores de referência; não permitem inferir custo de execuções sem tokens medidos e tarifa ativa.</p>
         </details>}
     </div>
