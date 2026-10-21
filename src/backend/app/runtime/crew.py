@@ -1,6 +1,7 @@
 """Sequential, validated agent stages; no agent can write to ServiceNow."""
 
 import os
+import re
 import time
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -36,6 +37,16 @@ IMPACT_URGENCY_SCALE = (
     "(1 = trabalho parado sem alternativa; 2 = trabalho degradado ou com contorno; "
     "3 = pode aguardar)."
 )
+KNOWLEDGE_SECTIONS = {
+    "Sintomas": "symptoms",
+    "Perguntas de esclarecimento": "clarifying_questions",
+    "Procedimento": "procedure",
+    "Quando escalar": "escalation",
+    "Dados minimos para ticket": "ticket_fields",
+    "Proibido": "prohibited",
+}
+SNIPPET_LIMIT = 500
+SECTION_LIMIT = 800
 
 
 class ResponseDraft(BaseModel):
@@ -83,6 +94,16 @@ class InvalidAgentOutput(Exception):
     pass
 
 
+def knowledge_sections(content: str) -> dict[str, str]:
+    sections = {}
+    for block in re.split(r"^## ", content, flags=re.MULTILINE)[1:]:
+        heading, _, body = block.partition("\n")
+        key = KNOWLEDGE_SECTIONS.get(heading.strip())
+        if key and body.strip():
+            sections[key] = redact(body.strip())[:SECTION_LIMIT]
+    return sections
+
+
 def local_evidence(category: str, db: Session) -> list[dict]:
     if category not in CATEGORIES or category == "unknown":
         return []
@@ -105,11 +126,15 @@ def local_evidence(category: str, db: Session) -> list[dict]:
         or not content.strip()
     ):
         return []
+    sections = knowledge_sections(content)
+    # Legacy files without the standard headings keep the last-section snippet.
+    snippet = sections.get("procedure") or redact(content.split("## ")[-1].strip())
     return [
         {
             "title": redact(content.splitlines()[0].lstrip("# ")),
             "path": f"knowledge/{category}.md",
-            "snippet": redact(content.split("## ")[-1].strip())[:500],
+            "snippet": snippet[:SNIPPET_LIMIT],
+            "sections": sections,
         }
     ]
 
@@ -271,10 +296,12 @@ def run_workflow(
         ),
     }
     sources = local_evidence(triage_input.internal_category, db)
+    category_sources = sources
     evidence = stage(
         "KnowledgeAgent",
         "Selecionar somente evidencia local aplicavel",
         f"Relato redigido: {message}. Fontes elegiveis: {sources}. "
+        "Compare o relato com sections.symptoms de cada fonte. "
         "Selecione fontes com ao menos uma orientacao operacional aplicavel ao relato, "
         "mesmo que outras orientacoes sejam especificas a um subtipo nao confirmado. "
         "Para impressoras, energia e conexao visivel aplicam-se mesmo sem confirmar "
@@ -304,6 +331,10 @@ def run_workflow(
         "pela fonte e aplicaveis ao relato; nao presuma detalhes do equipamento. "
         "Se houver passos iniciais seguros na fonte, oriente-os antes de solicitar "
         "detalhes adicionais. Se nao houver, pergunte uma vez ou proponha ticket. "
+        "Oriente somente passos de sections.procedure. Ao pedir esclarecimento, "
+        "prefira as perguntas de sections.clarifying_questions. Se o relato "
+        "atender a algum criterio de sections.escalation, use open_ticket. "
+        "Nunca oriente nada listado em sections.prohibited. "
         "Nao invente procedimentos.",
         ResponseDraft,
     )
@@ -311,8 +342,9 @@ def run_workflow(
         "QAPolicyAgent",
         "Revisar seguranca e evidencias",
         f"Relato redigido: {message}. Fonte: {sources}. "
-        f"Resposta: {draft.model_dump_json()}. Vete instrucoes inseguras ou "
-        "procedimentos sem fonte. Abrir ticket ou pedir esclarecimento sem "
+        f"Resposta: {draft.model_dump_json()}. Vete instrucoes inseguras, "
+        "procedimentos sem fonte ou orientacoes listadas em sections.prohibited. "
+        "Abrir ticket ou pedir esclarecimento sem "
         "fonte e permitido se a resposta nao inventar procedimentos e for segura. "
         "Vete e bloqueie somente pedidos inseguros; aprove encaminhamento seguro.",
         PolicyDecision,
@@ -333,10 +365,18 @@ def run_workflow(
     if action == "open_ticket":
         if triage.missing_required_fields:
             raise InvalidAgentOutput("Minimum ticket data missing")
+        ticket_fields = [
+            source.get("sections", {})["ticket_fields"]
+            for source in category_sources
+            if source.get("sections", {}).get("ticket_fields")
+        ]
         payload = stage(
             "TicketingEscalationAgent",
             "Preparar incidente redigido",
             f"Relato redigido: {message}. Triagem: {triage.model_dump_json()}. "
+            f"Dados minimos da categoria: {ticket_fields}. "
+            "Organize na description os dados minimos presentes no relato e "
+            "indique quais nao foram informados; nao invente valores. "
             "Retorne somente cinco campos: short_description, description, "
             "impact, urgency, category. Sem dados pessoais ou credenciais.",
             TicketPayloadDraft,

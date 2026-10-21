@@ -511,6 +511,13 @@ def test_low_confidence_decision(
                     "Abrir ticket ou pedir esclarecimento sem fonte e permitido"
                     in self.task.description
                 )
+                assert "sections.prohibited" in self.task.description
+            if schema is crew.ResponseDraft:
+                assert "sections.escalation" in self.task.description
+                assert "Enviar senha temporaria pelo chat" in self.task.description
+            if schema is crew.TicketPayloadDraft:
+                assert "Conta corporativa afetada" in self.task.description
+                assert "nao invente valores" in self.task.description
             outputs = {
                 "TriageInput": {
                     "internal_category": "password_reset",
@@ -713,3 +720,62 @@ def test_local_evidence_redacts_title_before_model(
     assert len(evidence) == 1
     assert "synthetic-secret-value" not in str(evidence)
     assert "[REDACTED]" in evidence[0]["title"]
+
+
+def test_knowledge_sections_parse_standard_headings() -> None:
+    content = (
+        "# Senha\nAprovacao: somente para demo\n"
+        "## Sintomas\n- Senha expirada\n"
+        "## Procedimento\n1. Use o fluxo oficial.\n"
+        "## Quando escalar\n- Verificacao indisponivel\n"
+        "## Proibido\n- Pedir senha=synthetic-secret\n"
+        "## Secao livre\nIgnorada\n"
+        "## Dados minimos para ticket\n\n"
+    )
+    sections = crew.knowledge_sections(content)
+    assert sections["symptoms"] == "- Senha expirada"
+    assert sections["procedure"] == "1. Use o fluxo oficial."
+    assert sections["escalation"] == "- Verificacao indisponivel"
+    assert "synthetic-secret" not in sections["prohibited"]
+    assert "ticket_fields" not in sections
+    assert "Ignorada" not in str(sections)
+
+
+def test_local_evidence_exposes_all_sections_of_shipped_knowledge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "KNOWLEDGE_BASE_PATH", str(Path(__file__).resolve().parents[3] / "knowledge")
+    )
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        sync_catalog(db)
+        for category in crew.CATEGORIES:
+            if category == "unknown":
+                continue
+            [source] = crew.local_evidence(category, db)
+            assert set(source["sections"]) == set(crew.KNOWLEDGE_SECTIONS.values())
+            assert source["snippet"] == source["sections"]["procedure"][:500]
+            assert all(
+                len(text) <= crew.SECTION_LIMIT for text in source["sections"].values()
+            )
+    engine.dispose()
+
+
+def test_local_evidence_falls_back_to_last_section_for_legacy_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("KNOWLEDGE_BASE_PATH", str(tmp_path))
+    (tmp_path / "password_reset.md").write_text(
+        "# Senha\nAprovacao: somente para demo\n## Passos\nFluxo oficial.",
+        encoding="utf-8",
+    )
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        sync_catalog(db)
+        [source] = crew.local_evidence("password_reset", db)
+    engine.dispose()
+    assert source["snippet"] == "Passos\nFluxo oficial."
+    assert source["sections"] == {}

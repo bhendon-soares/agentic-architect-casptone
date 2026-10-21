@@ -25,7 +25,7 @@ O chat usa `POST /api/chat/sessions`, `POST /api/chat/sessions/{session_id}/mess
 
 ## Backend P0 local
 
-Requer Python 3.11-3.13, Docker com Compose e PostgreSQL local. Na raiz do projeto, crie `.env` a partir de `.env.example` e ajuste `POSTGRES_PASSWORD` e `DATABASE_URL` com a mesma senha; nao versione esse arquivo. O Compose publica o banco apenas em `127.0.0.1:5432`. Para usar o catalogo deste checkout, mantenha `KNOWLEDGE_BASE_PATH=../../knowledge` (relativo a `src/backend`). A aprovacao nos arquivos em `knowledge/` e somente para demo; mudancas em uma fonte revogam a aprovacao ate revisao.
+Requer Python 3.11-3.13, Docker com Compose e PostgreSQL local. Na raiz do projeto, crie `.env` a partir de `.env.example` e ajuste `POSTGRES_PASSWORD` e `DATABASE_URL` com a mesma senha; nao versione esse arquivo. O Compose publica o banco apenas em `127.0.0.1:5432`. Para usar o catalogo deste checkout, mantenha `KNOWLEDGE_BASE_PATH=../../knowledge` (relativo a `src/backend`). A aprovacao nos arquivos em `knowledge/` e somente para demo; mudancas em uma fonte revogam a aprovacao ate revisao. Cada fonte usa as secoes `## Sintomas`, `## Perguntas de esclarecimento`, `## Procedimento`, `## Quando escalar`, `## Dados minimos para ticket` e `## Proibido` (ate 800 caracteres cada); os agentes recebem cada secao separadamente e o `snippet` exibido vem de `Procedimento`.
 
 ```bash
 python3.11 -m venv .venv
