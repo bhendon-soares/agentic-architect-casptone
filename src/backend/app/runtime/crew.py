@@ -11,8 +11,9 @@ from urllib.parse import urlparse
 
 import yaml
 from crewai import LLM, Agent, Crew, Process, Task
+from crewai.llms.providers.openai.completion import OpenAICompletion
 from crewai.types.usage_metrics import UsageMetrics
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -92,6 +93,41 @@ class RuntimeUnavailable(Exception):
 
 class InvalidAgentOutput(Exception):
     pass
+
+
+def measured_openai_usage(response: object) -> tuple[int, int, int] | None:
+    usage = getattr(response, "usage", None)
+    input_tokens = getattr(usage, "prompt_tokens", None)
+    output_tokens = getattr(usage, "completion_tokens", None)
+    details = getattr(usage, "prompt_tokens_details", None)
+    if input_tokens is None:
+        input_tokens = getattr(usage, "input_tokens", None)
+        output_tokens = getattr(usage, "output_tokens", None)
+        details = getattr(usage, "input_tokens_details", None)
+    cached_tokens = getattr(details, "cached_tokens", None)
+    if (
+        not all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in (input_tokens, output_tokens, cached_tokens)
+        )
+        or cached_tokens > input_tokens
+    ):
+        return None
+    return input_tokens, output_tokens, cached_tokens
+
+
+class MeteredOpenAICompletion(OpenAICompletion):
+    _observed_usage: list[tuple[int, int, int] | None] = PrivateAttr(
+        default_factory=list
+    )
+
+    def _extract_openai_token_usage(self, response):
+        self._observed_usage.append(measured_openai_usage(response))
+        return super()._extract_openai_token_usage(response)
+
+    def _extract_responses_token_usage(self, response):
+        self._observed_usage.append(measured_openai_usage(response))
+        return super()._extract_responses_token_usage(response)
 
 
 def knowledge_sections(content: str) -> dict[str, str]:
@@ -186,6 +222,14 @@ def run_workflow(
                 base_url=os.environ["AZURE_ENDPOINT"],
                 api_key=os.environ["AZURE_API_KEY"],
             )
+        direct_openai = model == "openai/gpt-4.1-mini" and not any(
+            os.getenv(name) for name in ("OPENAI_BASE_URL", "OPENAI_API_BASE")
+        )
+        llm = (
+            MeteredOpenAICompletion(model="gpt-4.1-mini", timeout=LLM_TIMEOUT_SECONDS)
+            if direct_openai
+            else LLM(**llm_options)
+        )
         agent = Agent(
             role=agents_config[name]["role"],
             goal=agents_config[name]["goal"],
@@ -194,7 +238,7 @@ def run_workflow(
             max_iter=MAX_ITER,
             max_rpm=max_rpm,
             max_execution_time=MAX_EXECUTION_SECONDS,
-            llm=LLM(**llm_options),
+            llm=llm,
             verbose=False,
         )
         task = Task(
@@ -238,6 +282,20 @@ def run_workflow(
                     telemetry.cache_in_input = True
                 if usage.cache_creation_tokens > 0:
                     telemetry.tokens_cache_write = usage.cache_creation_tokens
+            if (
+                isinstance(llm, MeteredOpenAICompletion)
+                and isinstance(usage, UsageMetrics)
+                and usage.successful_requests == len(llm._observed_usage)
+                and llm._observed_usage
+            ):
+                observed = llm._observed_usage
+                if all(item is not None for item in observed):
+                    telemetry.tokens_input = sum(item[0] for item in observed)
+                    telemetry.tokens_output = sum(item[1] for item in observed)
+                    telemetry.tokens_cache = sum(item[2] for item in observed)
+                    telemetry.tokens_cache_write = 0
+                    telemetry.cache_in_input = True
+                    telemetry.deployment_id = "openai"
             if result.pydantic is None:
                 raise InvalidAgentOutput("Invalid structured output")
             validated = schema.model_validate(result.pydantic.model_dump())

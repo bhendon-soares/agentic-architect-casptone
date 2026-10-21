@@ -767,6 +767,62 @@ def test_model_change_without_recorded_deployment_never_prices(
     db.close()
 
 
+def test_direct_openai_cost_reaches_admin_console_contract(client: TestClient) -> None:
+    db = next(app.dependency_overrides[get_session]())
+    when = datetime.now(timezone.utc)
+    session = ChatSession()
+    db.add(session)
+    db.flush()
+    run = AgentRun(
+        session_id=session.session_id,
+        status="completed",
+        final_action="respond",
+        started_at=when,
+    )
+    db.add(run)
+    db.flush()
+    db.add(
+        AgentRunTelemetry(
+            agent_run_id=run.agent_run_id,
+            step_index=0,
+            step_name="triage",
+            timestamp_start=when,
+            timestamp_end=when,
+            duration_ms=1,
+            state="complete",
+            model_used="openai/gpt-4.1-mini",
+            deployment_id="openai",
+            tokens_input=1000,
+            tokens_output=500,
+            tokens_cache=200,
+            tokens_cache_write=0,
+            cache_in_input=True,
+        )
+    )
+    for kind, rate in (("input", "0.40"), ("cache", "0.10"), ("output", "1.60")):
+        db.add(
+            PricingConfigVersion(
+                model="openai/gpt-4.1-mini",
+                deployment_id="openai",
+                currency="USD",
+                token_type=kind,
+                rate_per_million=rate,
+                valid_from=when - timedelta(seconds=1),
+                active=True,
+            )
+        )
+    db.commit()
+    item = client.get("/api/ia-tab/details").json()["data"]["items"][0]
+    summary = client.get("/api/ia-tab/summary").json()["data"]
+    prices = client.get("/api/ia-tab/pricing-config").json()["data"]["items"]
+    assert item["estimated_cost_value"] == pytest.approx(0.00114)
+    assert item["estimated_cost_currency"] == "USD"
+    assert len(item["pricing_config_ids"]) == 3
+    assert summary["estimated_cost_value"] == pytest.approx(0.00114)
+    assert summary["cost_sample_size"] == summary["cost_required_rows"] == 1
+    assert {price["token_type"] for price in prices} == {"input", "cache", "output"}
+
+
 def test_ia_cost_needs_exact_valid_usd_rates_and_known_cache(
     client: TestClient,
 ) -> None:
@@ -1106,6 +1162,7 @@ def test_ia_migration_round_trip() -> None:
         "20261013_01_initial.py",
         "20261019_01_ia_telemetry.py",
         "20261021_01_ticket_submission.py",
+        "20261022_01_openai_pricing.py",
     ):
         spec = importlib.util.spec_from_file_location(
             name.removesuffix(".py"), paths / name
@@ -1119,6 +1176,13 @@ def test_ia_migration_round_trip() -> None:
         for revision in revisions:
             revision.op = operations
             revision.upgrade()
+        prices = connection.execute(
+            PricingConfigVersion.__table__.select().where(
+                PricingConfigVersion.model == "openai/gpt-4.1-mini"
+            )
+        ).all()
+        assert {price.token_type for price in prices} == {"input", "cache", "output"}
+        assert all(price.active and price.deployment_id == "openai" for price in prices)
         assert set(inspect(connection).get_table_names()) == set(Base.metadata.tables)
         assert "original_run_id" in {
             col["name"] for col in inspect(connection).get_columns("agent_runs")

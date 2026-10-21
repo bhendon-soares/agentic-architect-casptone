@@ -1,5 +1,13 @@
 # Integracao do chat P0
 
+## Custo do novo modelo OpenAI na aba IA (2026-10-22)
+
+Com `.env` local configurado para `LLM_MODEL=openai/gpt-4.1-mini` e `OPENAI_API_KEY`, executar `cd src/backend && ../../.venv/bin/dotenv -f ../../.env run -- ../../.venv/bin/alembic upgrade head` e reiniciar o backend. Nao expor o `.env` nem publicar o console/proxy fora de loopback. A revisao `20261022_01` ativa a tarifa padrao OpenAI direta, USD/milhao de tokens: entrada 0,40; cache 0,10; saida 1,60. A vigencia comeca no instante da migracao; ela nao reprecifica o historico. Conferir valores atuais/contrato em https://developers.openai.com/api/docs/pricing antes de usar estimativas para decisoes financeiras.
+
+Em `/admin`, abrir a aba IA; `Custo estimado` mostra o total em USD quando todas as etapas do filtro tem uso completo. Em `Execucoes e etapas`, cada registro mostra tokens de entrada/saida/leitura/escrita de cache, valor por etapa e vigencia da tarifa. `Tarifas de referencia` continuam separadas e nao entram na conta; `/api/ia-tab/pricing-config` apresenta as tres versoes ativas. O frontend ja consumia esses endpoints e nao precisou de mudanca no contrato. Filtrar por modelo `openai/gpt-4.1-mini` separa execucoes novas das Azure antigas; custo total sem esse filtro pode ficar `nao disponivel` pela cobertura incompleta, mesmo quando etapas OpenAI individuais mostram custo. Para inspecionar somente a nova execucao, usar filtro de periodo e modelo.
+
+A captura OpenAI direta usa as respostas por chamada da CrewAI e so registra zero em cache quando o detalhe do provider o informa explicitamente. Sem detalhe de cache, com base URL OpenAI customizada, com outro modelo ou etapa falha, exibe `nao disponivel`; nenhuma inferencia e feita sobre credito restante, gastos externos ao app ou valor final da fatura. Azure/ServiceNow seguem inalterados. Testes locais sem API paga cobrem captura, tarifa migrada, `/summary`, `/details` e `/pricing-config`; verificacao live da OpenAI ainda pendente. Os procedimentos Azure abaixo descrevem o estado anterior e continuam validos apenas para Azure, nao para esta rota OpenAI.
+
 ## Integracao de estados de ticket, custo e console admin (2026-10-21)
 
 ### Regressao do Console Admin: causas e correcoes

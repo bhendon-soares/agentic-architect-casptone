@@ -96,6 +96,112 @@ def test_mock_is_stable() -> None:
     )
 
 
+def test_openai_usage_requires_explicit_cache_measurement() -> None:
+    def completion(cached):
+        return SimpleNamespace(
+            usage=SimpleNamespace(
+                prompt_tokens=100,
+                completion_tokens=20,
+                prompt_tokens_details=SimpleNamespace(cached_tokens=cached),
+            )
+        )
+
+    assert crew.measured_openai_usage(completion(0)) == (100, 20, 0)
+    assert crew.measured_openai_usage(completion(30)) == (100, 20, 30)
+    assert crew.measured_openai_usage(completion(None)) is None
+    assert crew.measured_openai_usage(completion(101)) is None
+    assert crew.measured_openai_usage(SimpleNamespace(usage=None)) is None
+    assert crew.measured_openai_usage(
+        SimpleNamespace(
+            usage=SimpleNamespace(
+                input_tokens=100,
+                output_tokens=20,
+                input_tokens_details=SimpleNamespace(cached_tokens=0),
+            )
+        )
+    ) == (100, 20, 0)
+
+
+@pytest.mark.parametrize("missing_cache", [False, True])
+def test_openai_stage_records_only_complete_provider_usage(
+    monkeypatch: pytest.MonkeyPatch, missing_cache: bool
+) -> None:
+    monkeypatch.setenv("LLM_MODEL", "openai/gpt-4.1-mini")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+    monkeypatch.setenv(
+        "KNOWLEDGE_BASE_PATH", str(Path(__file__).resolve().parents[3] / "knowledge")
+    )
+
+    class FakeMetered:
+        def __init__(self, **kwargs):
+            self.model = kwargs["model"]
+            self._observed_usage = []
+
+    monkeypatch.setattr(crew, "MeteredOpenAICompletion", FakeMetered)
+    monkeypatch.setattr(crew, "Agent", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(crew, "Task", lambda **kwargs: SimpleNamespace(**kwargs))
+
+    class FakeCrew:
+        def __init__(self, **kwargs):
+            self.agent = kwargs["agents"][0]
+            self.schema = kwargs["tasks"][0].output_pydantic
+
+        def kickoff(self):
+            assert self.agent.llm.model == "gpt-4.1-mini"
+            self.agent.llm._observed_usage.extend(
+                [(100, 20, 0), None if missing_cache else (50, 10, 10)]
+            )
+            output = {
+                "TriageInput": dict(
+                    internal_category="password_reset",
+                    impact=3,
+                    urgency=2,
+                    confidence=0.9,
+                ),
+                "EvidenceSet": dict(selected_paths=["knowledge/password_reset.md"]),
+                "ResponseDraft": dict(
+                    candidate_action="respond",
+                    message_pt_br="Use o fluxo oficial.",
+                    summary="Fonte consultada.",
+                ),
+                "PolicyDecision": dict(approved=True, veto_to_blocked=False),
+            }[self.schema.__name__]
+            return SimpleNamespace(
+                pydantic=self.schema.model_validate(output),
+                token_usage=UsageMetrics(
+                    prompt_tokens=150, completion_tokens=30, successful_requests=2
+                ),
+            )
+
+    monkeypatch.setattr(crew, "Crew", FakeCrew)
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        session = ChatSession()
+        db.add(session)
+        db.flush()
+        run = AgentRun(session_id=session.session_id)
+        db.add(run)
+        db.commit()
+        crew.run_workflow("Esqueci minha senha corporativa", 0, db, run.agent_run_id)
+        from app.persistence.models import AgentRunTelemetry
+
+        rows = db.scalars(select(AgentRunTelemetry)).all()
+        assert len(rows) == 4
+        for row in rows:
+            assert row.model_used == "openai/gpt-4.1-mini"
+            if missing_cache:
+                assert row.deployment_id is None
+                assert row.tokens_cache is None
+            else:
+                assert row.deployment_id == "openai"
+                assert (row.tokens_input, row.tokens_output) == (150, 30)
+                assert (row.tokens_cache, row.tokens_cache_write) == (10, 0)
+                assert row.cache_in_input is True
+    engine.dispose()
+
+
 @pytest.mark.skipif(
     os.getenv("RUN_LIVE_SERVICENOW") != "1",
     reason="Explicit POST authorization required",
