@@ -106,11 +106,11 @@ export default function IaPanel({ onConversation, onRun }: { onConversation: (id
         {!loading && !error && summary && series && details && !noRuns && <>
             <section aria-label="Indicadores IA" className="admin-metrics ia-metrics">
                 {[
-                    ['Execuções', available(summary.executions)],
-                    ['Custo estimado', formatCurrency(summary.estimated_cost.value, summary.estimated_cost.currency)],
-                    ['Latência média de etapa', formatDuration(summary.stage_mean_ms.value)],
-                    ['p95 de etapa (nearest-rank)', summary.stage_p95_ms.sample_size === 0 ? 'não disponível' : summary.stage_p95_ms.sample_size >= 20 ? formatDuration(summary.stage_p95_ms.value) : 'amostra insuficiente'],
-                ].map(([label, value]) => <KpiCard key={label} label={label} value={value} definition="Valor agregado retornado pelo servidor para os filtros selecionados." />)}
+                    ['Execuções', available(summary.executions), 'Quantidade de atendimentos da IA no período e filtros selecionados.'],
+                    ['Custo estimado', formatCurrency(summary.estimated_cost.value, summary.estimated_cost.currency), 'Soma dos custos estimados das etapas com tokens e tarifa disponíveis. Não é uma cobrança definitiva.'],
+                    ['Latência média de etapa', formatDuration(summary.stage_mean_ms.value), 'Tempo médio de execução das etapas com duração medida, nos filtros selecionados.'],
+                    ['p95 de etapa (nearest-rank)', summary.stage_p95_ms.sample_size === 0 ? 'não disponível' : summary.stage_p95_ms.sample_size >= 20 ? formatDuration(summary.stage_p95_ms.value) : 'amostra insuficiente', 'Duração que 95% das etapas medidas não ultrapassam, pelo método nearest-rank. Exibida com pelo menos 20 etapas.'],
+                ].map(([label, value, definition]) => <KpiCard key={label} label={label} value={value} definition={definition} />)}
             </section>
             <p className="admin-muted">{summary.estimated_cost.sample_size >= summary.estimated_cost.required_rows ? `Amostras: custo ${summary.estimated_cost.sample_size} de ${summary.estimated_cost.required_rows} etapas` : `Cobertura incompleta: ${summary.estimated_cost.sample_size} de ${summary.estimated_cost.required_rows} etapas com custo calculável`}; latência média {summary.stage_mean_ms.sample_size}; p95 {summary.stage_p95_ms.sample_size} etapas concluídas.{summary.estimated_cost.value != null && summary.estimated_cost.currency === 'USD' ? ' Custo em USD é estimativa.' : ''}</p>
             <div className="ia-charts">
@@ -129,7 +129,7 @@ export default function IaPanel({ onConversation, onRun }: { onConversation: (id
                     ['Tentativas reais observadas', summary.observed_model_attempts, 'Chamadas ao modelo comprovadas por telemetria do runtime ou provider; execução da crew não prova uma tentativa.'],
                     ['Retentativas operacionais', summary.operational_retries, 'Novas execuções do fluxo vinculadas à execução original.'],
                     ['Replays', summary.replays, 'Respostas persistidas devolvidas por idempotência; não executam etapas nem acrescentam custo.'],
-                ].map(([label, value, description]) => <div key={label} className="admin-metric"><span>{label} <span className="ia-help" tabIndex={0} title={String(description)} aria-label={String(description)}>ⓘ</span></span><strong>{available(value as number | null)}</strong><small>{description}</small></div>)}
+                ].map(([label, value, description]) => <div key={label} className="admin-metric"><span>{label} <span className="ia-help" tabIndex={0} title={String(description)} aria-label={String(description)}>i</span></span><strong>{available(value as number | null)}</strong><small>{description}</small></div>)}
             </div></section>
             <section className="admin-section" aria-label="Detalhes por execução e etapa"><div className="admin-section-heading"><h2>Execuções e etapas</h2><span>{details.total} registros · {period}</span></div>
                 {details.items.length === 0 ? <p className="admin-muted">Nenhuma etapa encontrada para estes filtros.</p> : <div className="ia-table-scroll"><table className="ia-table"><thead><tr><th>Execução / etapa</th><th>Modelo / estado</th><th>Início / fim</th><th>Duração</th><th>Tokens entrada / saída / leitura / escrita de cache</th><th>Custo estimado</th><th>Tentativas / retentativas / replays</th></tr></thead><tbody>

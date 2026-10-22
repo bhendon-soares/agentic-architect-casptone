@@ -182,7 +182,7 @@ export default function AdminConsole() {
                     {error && <p role="alert" className="admin-error">{error}</p>}
                     {loading && <p role="status" className="admin-muted">Carregando dados…</p>}
 
-                    {tab === 'overview' && <section aria-label="Métricas" className="admin-metrics">
+                    {tab === 'overview' && <section aria-label="Métricas" className="admin-metrics overview-metrics">
                         {[
                             ['Conversas', metrics?.total_conversations, 'Total de conversas registrado pelo servidor.'],
                             ['Tickets criados', metrics?.tickets_created, 'Incidentes confirmados pelo ServiceNow; não inclui tickets simulados.'],

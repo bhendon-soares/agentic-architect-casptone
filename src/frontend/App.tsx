@@ -61,10 +61,15 @@ export default function App() {
   const running = useRef(false)
   const nextId = useRef(0)
   const activeSession = useRef<string | null>(null)
+  const conversationRef = useRef<HTMLElement>(null)
 
   useEffect(() => {
     if (sessions.length) void selectSession(sessions[0])
   }, [])
+
+  useEffect(() => {
+    if (conversationRef.current) conversationRef.current.scrollTop = conversationRef.current.scrollHeight
+  }, [messages, status])
 
   function rememberSession(id: string) {
     setSessions((current) => {
@@ -193,7 +198,7 @@ export default function App() {
   const statusTone = status === 'running' || statusLabel === 'Aguardando você' ? 'info' : statusLabel === 'Concluído' || statusLabel === 'Ticket aberto' ? 'success' : statusLabel === 'Bloqueado' || statusLabel.includes('incerto') ? 'warning' : statusLabel === 'Falhou' || statusLabel.startsWith('Faltam') ? 'danger' : 'neutral'
 
   return (
-    <div className="app-shell">
+    <div className="app-shell chat-shell">
       <header className="topbar">
         <a className="brand" href="/" aria-label="Help Desk TI Multi Agent MVP - voltar ao chat"><span className="brand-mark" aria-hidden="true">S/</span><span>Help Desk TI Multi Agent MVP</span></a>
         <a className="topbar-link" href="/admin">Console admin</a>
@@ -213,12 +218,12 @@ export default function App() {
           </div>
         </div>
 
-        <section className="conversation" aria-label="Histórico da conversa" aria-live="polite">
+        <section ref={conversationRef} className="conversation" aria-label="Histórico da conversa" aria-live="polite">
           {messages.length === 0 && <div className="empty-state"><span className="empty-glyph" aria-hidden="true">↗</span><h2>Seu atendimento começa aqui.</h2><p>Descreva o problema para receber uma orientação baseada na fonte local.</p></div>}
           {messages.map((message) => <article className={`message ${message.role}`} key={message.id}>
             <span className="message-avatar" aria-hidden="true">{message.role === 'user' ? 'EU' : 'TI'}</span>
             <div className="message-content">
-              <span className="message-author">{message.role === 'user' ? 'Você' : 'Suporte TI · demonstração'}</span>
+              <span className="message-author">{message.role === 'user' ? 'Você' : 'Help Desk TI'}</span>
               {message.role === 'user' || message.role === 'notice' ? <p>{message.text}</p> : <>
                 <div className="answer-text"><ReactMarkdown skipHtml allowedElements={['p', 'strong', 'em', 'ul', 'ol', 'li', 'code', 'br']}>{message.result.message_pt_br}</ReactMarkdown></div>
                 {message.result.ticket && <p className="ticket-number">{message.result.ticket.status === 'created' && message.result.ticket.adapter_mode === 'mock' ? `Ticket simulado, não enviado ao ServiceNow: ${message.result.ticket.servicenow_number}` : message.result.ticket.status === 'created' && message.result.ticket.servicenow_number ? `Ticket aberto: ${message.result.ticket.servicenow_number}` : message.result.ticket.status === 'outcome_unknown' ? 'Resultado do ticket incerto' : message.result.ticket.status === 'failed' ? 'Abertura do ticket falhou' : 'Estado do ticket a verificar'}</p>}

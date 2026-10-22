@@ -62,7 +62,7 @@ export function IdChip({ id }: { id: string }) {
     return <span className="id-chip"><span title={id}>{id.slice(0, 8)}</span><button type="button" aria-label={`Copiar ID ${id}`} title="Copiar ID completo" onClick={() => void navigator.clipboard?.writeText(id)}>⧉</button></span>
 }
 export function KpiCard({ label, value, definition, period }: { label: string; value: string | number; definition: string; period?: string }) {
-    return <div className="admin-metric"><span>{label} <span className="ia-help" tabIndex={0} role="img" title={definition} aria-label={definition}>ⓘ</span></span><strong>{value}</strong>{period && <small>{period}</small>}</div>
+    return <div className="admin-metric"><span>{label} <span className="ia-help" tabIndex={0} role="img" title={definition} aria-label={definition}>i</span></span><strong>{value}</strong>{period && <small>{period}</small>}</div>
 }
 export function AvisoDeLacuna({ notices }: { notices: { type: string; text: string }[] }) {
     return <div className="gap-notices">{[...new Map(notices.map((notice) => [notice.type, notice])).values()].map((notice) => <p role="status" className="admin-muted" key={notice.type}>{notice.text}</p>)}</div>

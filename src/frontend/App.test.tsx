@@ -49,6 +49,8 @@ test('creates a session, posts the message and displays the sourced result', asy
   expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/chat/sessions', expect.objectContaining({ method: 'POST' }))
   expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/chat/sessions/session-1/messages', expect.objectContaining({ body: JSON.stringify({ message_text: submitted }) }))
   expect(screen.getByText('Redefinição de senha')).toBeTruthy()
+  expect(screen.getByText('Help Desk TI')).toBeTruthy()
+  expect(screen.queryByText('Suporte TI · demonstração')).toBeNull()
   expect(screen.queryByText('knowledge/password_reset.md')).toBeNull()
   expect(screen.getByText(/Use o fluxo oficial de redefinição de senha/)).toBeTruthy()
   expect(JSON.parse(localStorage.getItem('support-chat-sessions')!)).toEqual(['session-1'])
@@ -404,6 +406,15 @@ test('IA filters and pagination query the server and preserve null versus zero',
   expect(prices.textContent).toContain('US$ 2,50')
   expect(prices.textContent).not.toContain('Exemplos sem cache')
   expect(within(screen.getByRole('region', { name: 'Indicadores IA' })).getByText('Custo estimado').parentElement?.textContent).toContain('não disponível')
+  for (const [label, definition] of [
+    ['Execuções', 'Quantidade de atendimentos da IA'],
+    ['Custo estimado', 'Soma dos custos estimados'],
+    ['Latência média de etapa', 'Tempo médio de execução'],
+    ['p95 de etapa (nearest-rank)', 'Duração que 95% das etapas'],
+  ]) {
+    const card = within(screen.getByRole('region', { name: 'Indicadores IA' })).getByText(label).parentElement!
+    expect(within(card).getByRole('img').getAttribute('title')).toContain(definition)
+  }
   expect(screen.getByText('Tentativas reais observadas').parentElement?.parentElement?.textContent).toContain('não disponível')
   expect(screen.getByText('Replays').parentElement?.parentElement?.textContent).toContain('0')
   const filters = screen.getByLabelText('Filtros IA')
