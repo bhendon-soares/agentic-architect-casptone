@@ -267,3 +267,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# CrewAI local run state
+.crewai/
