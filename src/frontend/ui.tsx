@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
-import { LogOut } from 'lucide-react'
+import { Check, Copy, LogOut } from 'lucide-react'
 import type { AuthUser } from './chatApi'
 
 export type Tone = 'success' | 'info' | 'warning' | 'danger' | 'neutral'
@@ -73,8 +73,24 @@ const codes: Record<string, string> = {
 export function ErrorCodeLabel({ code }: { code: string | null }) {
     return code ? <span className="error-code">{codes[code] ?? 'Falha registrada'} <small>{code}</small></span> : null
 }
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 export function IdChip({ id }: { id: string }) {
-    return <span className="id-chip"><span title={id}>{id.slice(0, 8)}</span><button type="button" aria-label={`Copiar ID ${id}`} title="Copiar ID completo" onClick={() => void navigator.clipboard?.writeText(id)}>⧉</button></span>
+    const [feedback, setFeedback] = useState<'copied' | 'error' | null>(null)
+    useEffect(() => {
+        if (!feedback) return
+        const timer = window.setTimeout(() => setFeedback(null), 2000)
+        return () => window.clearTimeout(timer)
+    }, [feedback])
+    async function copyId() {
+        try {
+            if (!navigator.clipboard) throw new Error('Clipboard unavailable')
+            await navigator.clipboard.writeText(id)
+            setFeedback('copied')
+        } catch {
+            setFeedback('error')
+        }
+    }
+    return <span className="id-chip"><span title={id}>{UUID_PATTERN.test(id) ? id.slice(0, 8) : id}</span><button type="button" className={feedback === 'copied' ? 'copied' : undefined} aria-label={`Copiar ID ${id}`} title="Copiar ID completo" onClick={() => void copyId()}>{feedback === 'copied' ? <Check size={16} aria-hidden="true" /> : <Copy size={16} aria-hidden="true" />}</button><span className={`id-chip-feedback${feedback === 'error' ? ' error' : ''}`} role="status">{feedback === 'copied' ? 'ID copiado' : feedback === 'error' ? 'Não foi possível copiar' : ''}</span></span>
 }
 export function KpiCard({ label, value, definition, period }: { label: string; value: string | number; definition: string; period?: string }) {
     return <div className="admin-metric"><span>{label} <span className="ia-help" tabIndex={0} role="img" title={definition} aria-label={definition}>i</span></span><strong>{value}</strong>{period && <small>{period}</small>}</div>

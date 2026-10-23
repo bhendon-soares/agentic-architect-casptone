@@ -688,6 +688,7 @@ h2 {
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  flex-wrap: wrap;
   font-variant-numeric: tabular-nums;
 }
 
@@ -696,6 +697,33 @@ h2 {
   background: transparent;
   color: var(--accent);
   padding: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  border-radius: var(--radius);
+}
+
+.id-chip button:hover,
+.id-chip button:focus-visible {
+  background: var(--surface-2);
+}
+
+.id-chip button.copied {
+  color: var(--status-success);
+}
+
+.id-chip-feedback:not(:empty) {
+  padding: 4px 6px;
+  border-radius: var(--radius);
+  background: var(--surface-raised);
+  color: var(--status-success);
+  font-size: 12px;
+  font-weight: normal;
+}
+
+.id-chip-feedback.error {
+  color: var(--status-danger);
 }
 
 .theme-choice {
