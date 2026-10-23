@@ -3,33 +3,39 @@
 import importlib.util
 import json
 import os
+import secrets
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
+import httpx
+import jwt
 import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
-from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, delete, or_, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
-from starlette.requests import Request
 
 from app.adapters.tickets import TicketOutcomeUnknown, TicketRejected
-from app.main import app, local_admin
+from app.auth import hasher, secret
+from app.main import app
 from app.persistence.database import get_session
 from app.persistence.models import (
     AgentRun,
     AgentRunAttempt,
     AgentRunTelemetry,
+    AuthAudit,
     Base,
     ChatMessage,
     ChatSession,
+    LoginAttempt,
     PricingConfigVersion,
     Ticket,
+    User,
+    utc_now,
 )
 from app.runtime.crew import InvalidAgentOutput
 from app.runtime.policy import CATEGORIES, priority
@@ -38,6 +44,20 @@ CASES_PATH = (
     Path(__file__).resolve().parents[3] / "project-context/1.define/support-cases.json"
 )
 SUPPORT_CASES = json.loads(CASES_PATH.read_text(encoding="utf-8"))
+ADMIN_ID = "aaaaaaaa-0000-4000-8000-000000000000"
+
+
+def test_signing_key_requires_configured_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("JWT_SECRET", raising=False)
+    with pytest.raises(RuntimeError, match="JWT_SECRET"):
+        secret()
+    monkeypatch.setenv("JWT_SECRET", "short")
+    with pytest.raises(RuntimeError, match="JWT_SECRET"):
+        secret()
+    monkeypatch.setenv("JWT_SECRET", "test-secret-that-has-more-than-32-bytes")
+    assert secret() == "test-secret-that-has-more-than-32-bytes"
 
 
 @pytest.fixture
@@ -47,10 +67,26 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     monkeypatch.setenv(
         "KNOWLEDGE_BASE_PATH", str(Path(__file__).resolve().parents[3] / "knowledge")
     )
+    monkeypatch.setenv("JWT_SECRET", "test-secret-that-has-more-than-32-bytes")
+    monkeypatch.setenv("APP_ALLOWED_ORIGINS", "http://testserver")
+    monkeypatch.setenv("COOKIE_SECURE", "false")
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
     )
     Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        db.add(
+            User(
+                user_id=ADMIN_ID,
+                email="admin@example.com",
+                display_name="Admin",
+                password_hash=hasher.hash("test-admin-password"),
+                role="admin",
+                must_change_password=False,
+                password_changed_at=utc_now(),
+            )
+        )
+        db.commit()
 
     def test_session() -> Iterator[Session]:
         with Session(engine) as session:
@@ -58,7 +94,12 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
 
     app.dependency_overrides[get_session] = test_session
     try:
-        with TestClient(app) as http:
+        with TestClient(app, headers={"Origin": "http://testserver"}) as http:
+            response = http.post(
+                "/api/auth/login",
+                json={"email": "admin@example.com", "password": "test-admin-password"},
+            )
+            assert response.status_code == 200
             yield http
     finally:
         app.dependency_overrides.clear()
@@ -78,6 +119,271 @@ def test_session_and_admin_reads(client: TestClient) -> None:
     assert len(sources) == 7
     assert all(source["approved"] for source in sources)
     assert client.get("/api/metrics/summary").json()["data"]["total_conversations"] == 1
+
+
+def test_rbac_access_ownership_and_password_change(client: TestClient) -> None:
+    with TestClient(app) as anonymous:
+        for path in ("/api/chat/sessions", "/api/tickets", "/api/ia-tab/summary"):
+            response = anonymous.get(path)
+            assert response.status_code == 401
+            assert response.json()["error"]["code"] == "AUTH_REQUIRED"
+
+    created = client.post(
+        "/api/admin/users",
+        json={
+            "email": " User@Example.com ",
+            "display_name": "User",
+            "role": "user",
+            "temporary_password": "temporary-password-123",
+        },
+    )
+    assert created.status_code == 201
+    user_id = created.json()["data"]["user_id"]
+    admin_session = client.post("/api/chat/sessions", json={}).json()["data"][
+        "session_id"
+    ]
+    with TestClient(app, headers={"Origin": "http://testserver"}) as other:
+        assert (
+            other.post(
+                "/api/auth/login",
+                json={
+                    "email": "user@example.com",
+                    "password": "temporary-password-123",
+                },
+            ).status_code
+            == 200
+        )
+        assert (
+            other.get("/api/chat/sessions").json()["error"]["code"]
+            == "PASSWORD_CHANGE_REQUIRED"
+        )
+        assert other.get("/api/auth/me").json()["data"]["user"]["must_change_password"]
+        changed = other.post(
+            "/api/auth/change-password",
+            json={
+                "current_password": "temporary-password-123",
+                "new_password": "permanent-password-123",
+            },
+        )
+        assert changed.status_code == 200
+        for path in ("/api/tickets", "/api/admin/users", "/api/ia-tab/summary"):
+            assert other.get(path).json()["error"]["code"] == "FORBIDDEN_ROLE"
+        assert other.get(f"/api/chat/sessions/{admin_session}").status_code == 404
+        assert (
+            other.post(
+                f"/api/chat/sessions/{admin_session}/messages",
+                json={"message_text": "Test"},
+            ).status_code
+            == 404
+        )
+        own = other.post("/api/chat/sessions", json={}).json()["data"]["session_id"]
+        assert other.get("/api/chat/sessions").json()["data"]["total"] == 1
+        assert client.get(f"/api/chat/sessions/{own}").status_code == 404
+        assert client.get(f"/api/admin/conversations/{own}").status_code == 200
+        assert (
+            client.patch(
+                f"/api/admin/users/{user_id}", json={"is_active": False}
+            ).status_code
+            == 200
+        )
+        assert other.get("/api/auth/me").json()["error"]["code"] == "INVALID_TOKEN"
+
+
+def test_rbac_login_lock_csrf_and_admin_safety(client: TestClient) -> None:
+    assert (
+        client.post(
+            "/api/auth/login",
+            headers={"Origin": "https://other.example"},
+            json={"email": "admin@example.com", "password": "test-admin-password"},
+        ).json()["error"]["code"]
+        == "CSRF_REJECTED"
+    )
+    for count in range(5):
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"email": "admin@example.com", "password": "wrong"},
+            ).status_code
+            == 401
+        )
+    assert (
+        client.post(
+            "/api/auth/login",
+            json={"email": "admin@example.com", "password": "test-admin-password"},
+        ).json()["error"]["code"]
+        == "LOGIN_LOCKED"
+    )
+    with TestClient(
+        app, client=("198.51.100.5", 1234), headers={"Origin": "http://testserver"}
+    ) as other_ip:
+        assert (
+            other_ip.post(
+                "/api/auth/login",
+                json={"email": "admin@example.com", "password": "test-admin-password"},
+            ).status_code
+            == 200
+        )
+    assert (
+        client.post(
+            "/api/admin/login-locks/unlock",
+            json={"email": "admin@example.com", "ip": "testclient"},
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            "/api/auth/login",
+            json={"email": "admin@example.com", "password": "test-admin-password"},
+        ).status_code
+        == 200
+    )
+    assert (
+        client.patch(f"/api/admin/users/{ADMIN_ID}", json={"is_active": False}).json()[
+            "error"
+        ]["code"]
+        == "SELF_DEACTIVATION"
+    )
+    assert (
+        client.patch(f"/api/admin/users/{ADMIN_ID}", json={"role": "user"}).json()[
+            "error"
+        ]["code"]
+        == "SELF_ROLE_CHANGE"
+    )
+
+
+def test_rbac_token_revocation_and_last_admin(client: TestClient) -> None:
+    original = client.cookies.get("session")
+    assert original
+    client.cookies.set("session", original + "tampered")
+    assert client.get("/api/auth/me").json()["error"]["code"] == "INVALID_TOKEN"
+    claims = jwt.decode(original, secret(), algorithms=["HS256"])
+    claims["exp"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+    client.cookies.set(
+        "session", jwt.encode(claims, secret(), algorithm="HS256")
+    )
+    assert client.get("/api/auth/me").json()["error"]["code"] == "INVALID_TOKEN"
+    client.cookies.set("session", original)
+
+    created = client.post(
+        "/api/admin/users",
+        json={
+            "email": "second@example.com",
+            "display_name": "Second",
+            "role": "admin",
+            "temporary_password": "temporary-password-123",
+        },
+    ).json()["data"]
+    second_id = created["user_id"]
+    assert (
+        client.patch(f"/api/admin/users/{second_id}", json={"role": "user"}).status_code
+        == 200
+    )
+    db = next(app.dependency_overrides[get_session]())
+    with db:
+        other = db.get(User, second_id)
+        other.role = "admin"
+        db.commit()
+    with TestClient(app, headers={"Origin": "http://testserver"}) as second:
+        assert (
+            second.post(
+                "/api/auth/login",
+                json={
+                    "email": "second@example.com",
+                    "password": "temporary-password-123",
+                },
+            ).status_code
+            == 200
+        )
+        assert second.get("/api/auth/me").status_code == 200
+        assert (
+            client.patch(
+                f"/api/admin/users/{second_id}", json={"is_active": False}
+            ).status_code
+            == 200
+        )
+        assert second.get("/api/auth/me").json()["error"]["code"] == "INVALID_TOKEN"
+    db = next(app.dependency_overrides[get_session]())
+    with db:
+        assert (
+            db.scalar(select(User).where(User.user_id == second_id)).is_active is False
+        )
+        assert (
+            db.scalar(select(AuthAudit).where(AuthAudit.action == "user_updated"))
+            is not None
+        )
+    assert (
+        client.patch(f"/api/admin/users/{ADMIN_ID}", json={"is_active": False}).json()[
+            "error"
+        ]["code"]
+        == "SELF_DEACTIVATION"
+    )
+
+
+def test_logout_revokes_only_current_token(client: TestClient) -> None:
+    old_token = client.cookies.get("session")
+    assert old_token
+    with TestClient(app, headers={"Origin": "http://testserver"}) as other:
+        assert (
+            other.post(
+                "/api/auth/login",
+                json={"email": "admin@example.com", "password": "test-admin-password"},
+            ).status_code
+            == 200
+        )
+        assert client.post("/api/auth/logout").status_code == 200
+        client.cookies.set("session", old_token)
+        assert client.get("/api/auth/me").json()["error"]["code"] == "INVALID_TOKEN"
+        assert other.get("/api/auth/me").status_code == 200
+
+
+def test_session_revocation_migration_round_trip() -> None:
+    from sqlalchemy import inspect
+
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "migrations/versions/20261022_03_session_revocation.py"
+    )
+    spec = importlib.util.spec_from_file_location("session_revocation_migration", path)
+    assert spec and spec.loader
+    revision = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(revision)
+    assert revision.down_revision == "20261022_02"
+    engine = create_engine("sqlite://")
+    with engine.begin() as connection:
+        revision.op = Operations(MigrationContext.configure(connection))
+        revision.upgrade()
+        assert {
+            column["name"]
+            for column in inspect(connection).get_columns("revoked_sessions")
+        } == {"jti", "expires_at"}
+        revision.downgrade()
+        assert "revoked_sessions" not in inspect(connection).get_table_names()
+    engine.dispose()
+
+
+def test_rbac_migration_refuses_legacy_sessions() -> None:
+    path = (
+        Path(__file__).resolve().parents[1] / "migrations/versions/20261022_02_rbac.py"
+    )
+    spec = importlib.util.spec_from_file_location("rbac_migration", path)
+    assert spec and spec.loader
+    revision = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(revision)
+
+    class LegacyConnection:
+        def scalar(self, statement):
+            return 1
+
+    class LegacyOperations:
+        def get_bind(self):
+            return LegacyConnection()
+
+        def create_table(self, *args):
+            pytest.fail("migration modified tables before checking legacy sessions")
+
+    revision.op = LegacyOperations()
+    with pytest.raises(RuntimeError, match="Legacy sessions exist"):
+        revision.upgrade()
 
 
 def test_missing_ticket_data_after_clarification(
@@ -122,7 +428,14 @@ def test_admin_conversations_order_pagination_and_detail(client: TestClient) -> 
     start = datetime(2026, 10, 15, 12, tzinfo=timezone.utc)
     ids = [f"{index:08d}-0000-4000-8000-000000000000" for index in range(1, 5)]
     for session_id in ids:
-        db.add(ChatSession(session_id=session_id, created_at=start, updated_at=start))
+        db.add(
+            ChatSession(
+                session_id=session_id,
+                user_id=ADMIN_ID,
+                created_at=start,
+                updated_at=start,
+            )
+        )
     db.flush()
     db.add(
         ChatMessage(
@@ -232,14 +545,12 @@ def test_admin_local_and_invalid_requests(client: TestClient) -> None:
         response = client.get(path)
         assert response.json()["error"]["code"] == code
         assert response.json()["meta"]["request_id"]
-    with pytest.raises(HTTPException) as blocked:
-        local_admin(Request({"type": "http", "client": ("198.51.100.12", 1234)}))
-    assert blocked.value.status_code == 403
+    assert client.get("/api/auth/me").status_code == 200
 
 
 def test_source_metric_requires_completed_nonempty_sources(client: TestClient) -> None:
     db = next(app.dependency_overrides[get_session]())
-    session = ChatSession()
+    session = ChatSession(user_id=ADMIN_ID)
     db.add(session)
     db.flush()
     for status, sources in (
@@ -547,7 +858,7 @@ def test_response_replay_and_clarification(
 def test_ia_summary_details_filters_and_missing_data(client: TestClient) -> None:
     db = next(app.dependency_overrides[get_session]())
     start = datetime(2026, 10, 15, 12, tzinfo=timezone.utc)
-    session = ChatSession()
+    session = ChatSession(user_id=ADMIN_ID)
     db.add(session)
     db.flush()
     for index, result in enumerate(
@@ -715,7 +1026,7 @@ def test_model_change_without_recorded_deployment_never_prices(
     monkeypatch.setenv("LLM_MODEL", "azure/new-deployment")
     db = next(app.dependency_overrides[get_session]())
     when = datetime(2026, 10, 15, tzinfo=timezone.utc)
-    session = ChatSession()
+    session = ChatSession(user_id=ADMIN_ID)
     db.add(session)
     db.flush()
     run = AgentRun(
@@ -770,7 +1081,7 @@ def test_model_change_without_recorded_deployment_never_prices(
 def test_direct_openai_cost_reaches_admin_console_contract(client: TestClient) -> None:
     db = next(app.dependency_overrides[get_session]())
     when = datetime.now(timezone.utc)
-    session = ChatSession()
+    session = ChatSession(user_id=ADMIN_ID)
     db.add(session)
     db.flush()
     run = AgentRun(
@@ -828,7 +1139,7 @@ def test_ia_cost_needs_exact_valid_usd_rates_and_known_cache(
 ) -> None:
     db = next(app.dependency_overrides[get_session]())
     when = datetime(2026, 10, 15, tzinfo=timezone.utc)
-    session = ChatSession()
+    session = ChatSession(user_id=ADMIN_ID)
     db.add(session)
     db.flush()
     run = AgentRun(
@@ -988,7 +1299,7 @@ def test_ia_http_round_trip_with_partial_and_missing_measurements(
 ) -> None:
     db = next(app.dependency_overrides[get_session]())
     when = datetime(2026, 10, 15, 12, tzinfo=timezone.utc)
-    session = ChatSession()
+    session = ChatSession(user_id=ADMIN_ID)
     db.add(session)
     db.flush()
     db.add(
@@ -1183,7 +1494,9 @@ def test_ia_migration_round_trip() -> None:
         ).all()
         assert {price.token_type for price in prices} == {"input", "cache", "output"}
         assert all(price.active and price.deployment_id == "openai" for price in prices)
-        assert set(inspect(connection).get_table_names()) == set(Base.metadata.tables)
+        assert set(inspect(connection).get_table_names()) == set(
+            Base.metadata.tables
+        ) - {"users", "login_attempts", "auth_audit", "revoked_sessions"}
         assert "original_run_id" in {
             col["name"] for col in inspect(connection).get_columns("agent_runs")
         }
@@ -1343,7 +1656,7 @@ def test_ticket_success(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> 
 def test_admin_ticket_payload_is_local_only_and_states_are_explicit(
     client: TestClient,
 ) -> None:
-    session = ChatSession()
+    session = ChatSession(user_id=ADMIN_ID)
     db = next(app.dependency_overrides[get_session]())
     db.add(session)
     db.flush()
@@ -1398,12 +1711,9 @@ def test_admin_ticket_payload_is_local_only_and_states_are_explicit(
     db.close()
     with TestClient(app, client=("198.51.100.12", 1234)) as remote:
         blocked = remote.get(path)
-        assert blocked.status_code == 403
-        assert blocked.json()["error"]["code"] == "ADMIN_LOCAL_ONLY"
-        assert (
-            "redacted_payload"
-            not in remote.get(f"/api/tickets/{ticket_id}").json()["data"]
-        )
+        assert blocked.status_code == 401
+        assert blocked.json()["error"]["code"] == "AUTH_REQUIRED"
+        assert remote.get(f"/api/tickets/{ticket_id}").status_code == 401
 
 
 def test_mock_ticket_is_simulated_and_payload_stays_off_public_routes(
@@ -1609,4 +1919,98 @@ def test_postgres_revision_is_reversible() -> None:
     finally:
         with engine.begin() as connection:
             connection.exec_driver_sql(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        engine.dispose()
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_LIVE_AUTH_E2E") != "1", reason="requires running local API"
+)
+def test_live_auth_and_rbac() -> None:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parents[3] / ".env")
+    engine = create_engine(os.environ["DATABASE_URL"])
+    suffix = uuid4().hex
+    admin_id, user_id = str(uuid4()), str(uuid4())
+    admin_email = f"e2e-admin-{suffix}@example.test"
+    user_email = f"e2e-user-{suffix}@example.test"
+    admin_password, initial_password, new_password = (
+        secrets.token_urlsafe(24) for _ in range(3)
+    )
+    try:
+        with Session(engine) as db:
+            db.add_all([
+                User(user_id=admin_id, email=admin_email, display_name="E2E Admin",
+                     role="admin", password_hash=hasher.hash(admin_password),
+                     must_change_password=False, password_changed_at=utc_now()),
+                User(user_id=user_id, email=user_email, display_name="E2E User",
+                     role="user", password_hash=hasher.hash(initial_password),
+                     must_change_password=True, password_changed_at=utc_now()),
+            ])
+            db.commit()
+
+        origin = {"Origin": "http://127.0.0.1:5173"}
+        base_url = "http://127.0.0.1:8000"
+        with (
+            httpx.Client(base_url=base_url, headers=origin) as admin_client,
+            httpx.Client(base_url=base_url, headers=origin) as user_client,
+        ):
+            assert user_client.get("/api/auth/me").status_code == 401
+            assert httpx.post("http://127.0.0.1:8000/api/auth/login", json={
+                "email": user_email, "password": initial_password,
+            }).status_code == 403
+            assert admin_client.post("/api/auth/login", json={
+                "email": admin_email, "password": "incorrect-password",
+            }).status_code == 401
+            admin_login = admin_client.post("/api/auth/login", json={
+                "email": admin_email, "password": admin_password,
+            })
+            assert admin_login.status_code == 200
+            assert "httponly" in admin_login.headers["set-cookie"].lower()
+            assert "samesite=strict" in admin_login.headers["set-cookie"].lower()
+            assert (
+                admin_client.get("/api/auth/me").json()["data"]["user"]["role"]
+                == "admin"
+            )
+            assert admin_client.get("/api/admin/users").status_code == 200
+
+            assert user_client.post("/api/auth/login", json={
+                "email": user_email, "password": initial_password,
+            }).status_code == 200
+            assert (
+                user_client.post("/api/chat/sessions", json={}).json()["error"]["code"]
+                == "PASSWORD_CHANGE_REQUIRED"
+            )
+            assert user_client.post("/api/auth/change-password", json={
+                "current_password": initial_password, "new_password": new_password,
+            }).status_code == 200
+            assert (
+                user_client.get("/api/auth/me").json()["data"]["user"]["role"]
+                == "user"
+            )
+            assert user_client.get("/api/admin/users").status_code == 403
+            session = user_client.post("/api/chat/sessions", json={})
+            assert session.status_code == 201
+            session_id = session.json()["data"]["session_id"]
+            assert (
+                user_client.get(f"/api/chat/sessions/{session_id}").status_code == 200
+            )
+            assert (
+                admin_client.get(f"/api/admin/conversations/{session_id}").status_code
+                == 200
+            )
+            assert user_client.post("/api/auth/logout").status_code == 200
+            assert user_client.get("/api/auth/me").status_code == 401
+    finally:
+        with Session(engine) as db:
+            db.execute(delete(ChatSession).where(ChatSession.user_id == user_id))
+            db.execute(delete(AuthAudit).where(or_(
+                AuthAudit.actor_id.in_((admin_id, user_id)),
+                AuthAudit.target_id.in_((admin_id, user_id)),
+            )))
+            db.execute(delete(LoginAttempt).where(
+                LoginAttempt.email_normalized.in_((admin_email, user_email))
+            ))
+            db.execute(delete(User).where(User.user_id.in_((admin_id, user_id))))
+            db.commit()
         engine.dispose()

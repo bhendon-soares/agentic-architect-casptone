@@ -1,5 +1,12 @@
 # Frontend Build: UI integrada e historico da primeira etapa
 
+## Ajustes de acesso e usuarios (RBAC)
+
+- Login reutiliza a marca do chat, com titulo "Iniciar sessao" e ajuda secundaria mais discreta. Cabecalho compartilhado organiza navegacao, tema, nome formatado e saida ao lado do nome; o aviso de acesso restrito e um toast temporario fora do fluxo do chat.
+- Console de usuarios usa icones Lucide e dialogos nativos estilizados para renomear, mudar perfil/status, redefinir senha e desbloquear login. O aviso de nova conversa apos ticket incerto tambem usa dialogo no lugar de `window.confirm`.
+- Contrato atual: `POST /api/admin/users` recebe email no cadastro; `PATCH /api/admin/users/{user_id}` aceita apenas `display_name`, `role` e `is_active`. Alterar email exige mudanca explicita do backend e nao foi oferecido na UI.
+- Verificacao: 38 testes de UI e `npm run build` aprovados; login inspecionado em desktop e 390 px sem overflow horizontal. Console autenticado conferido parcialmente com resposta simulada; fluxos autenticados ponta a ponta nao foram verificados nesta revisao.
+
 ## Redesign da UI integrada (A) e limites (B)
 
 - Entregue: tema Sistema/Claro/Escuro, componentes compartilhados, chat com estados de resultado distintos e fonte sem caminho/trecho, cinco abas do console, timeline com payload redigido recolhido, IA com dados apenas do servidor, custo `null` distinto de zero e p95/maximo mascarados abaixo de 20 amostras. Nenhum endpoint novo ou alteracao de regras de ticket foi introduzido.

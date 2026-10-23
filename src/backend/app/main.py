@@ -3,17 +3,28 @@
 import os
 from datetime import datetime, timezone
 from hashlib import sha256
-from ipaddress import ip_address
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select, union_all
+from sqlalchemy import delete, func, select, text, union_all
 from sqlalchemy.orm import Session
 
 from app.adapters.tickets import TicketOutcomeUnknown, TicketRejected, create_incident
+from app.auth import (
+    client_ip,
+    current_user,
+    hasher,
+    normalized_email,
+    require_admin,
+    secret,
+    set_session_cookie,
+    user_data,
+    validate_password,
+    verify_password,
+)
 from app.knowledge.catalog import sync_catalog
 from app.persistence.database import get_session
 from app.persistence.models import (
@@ -21,10 +32,15 @@ from app.persistence.models import (
     AgentRun,
     AgentRunAttempt,
     AgentRunResultsSummary,
+    AuthAudit,
     ChatMessage,
     ChatSession,
     KnowledgeSource,
+    LoginAttempt,
+    RevokedSession,
     Ticket,
+    User,
+    utc_now,
 )
 from app.runtime.crew import (
     InvalidAgentOutput,
@@ -35,6 +51,11 @@ from app.runtime.crew import (
 from app.runtime.policy import TriageResult, redact, requests_third_party_secret
 
 app = FastAPI(title="IT Help Desk MVP")
+
+
+@app.on_event("startup")
+def check_secret() -> None:
+    secret()
 
 
 def envelope(
@@ -54,6 +75,14 @@ def envelope(
 @app.middleware("http")
 async def request_id(request: Request, call_next):
     request.state.request_id = str(uuid4())
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        allowed = {
+            origin.strip()
+            for origin in os.getenv("APP_ALLOWED_ORIGINS", "").split(",")
+            if origin.strip()
+        }
+        if request.headers.get("origin") not in allowed:
+            return failure(request, "CSRF_REJECTED", 403)
     return await call_next(request)
 
 
@@ -99,18 +128,6 @@ def identifier(value: str) -> str:
         raise HTTPException(422, "INVALID_ID") from exc
 
 
-def local_admin(request: Request) -> None:
-    host = request.client.host if request.client else ""
-    if host == "testclient":
-        return
-    try:
-        if ip_address(host).is_loopback:
-            return
-    except ValueError:
-        pass
-    raise HTTPException(403, "ADMIN_LOCAL_ONLY")
-
-
 def utc_iso(value: datetime | None) -> str | None:
     if value is None:
         return None
@@ -121,6 +138,38 @@ def utc_iso(value: datetime | None) -> str | None:
 
 class MessageInput(BaseModel):
     message_text: str = Field(min_length=1, max_length=2000)
+
+
+class LoginInput(BaseModel):
+    email: str = Field(min_length=3, max_length=255)
+    password: str
+
+
+class ChangePasswordInput(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class CreateUserInput(BaseModel):
+    email: str = Field(min_length=3, max_length=255)
+    display_name: str = Field(min_length=1, max_length=255)
+    role: str = Field(pattern="^(user|admin)$")
+    temporary_password: str = Field(min_length=12)
+
+
+class UpdateUserInput(BaseModel):
+    display_name: str | None = Field(None, min_length=1, max_length=255)
+    role: str | None = Field(None, pattern="^(user|admin)$")
+    is_active: bool | None = None
+
+
+class ResetPasswordInput(BaseModel):
+    temporary_password: str = Field(min_length=12)
+
+
+class UnlockInput(BaseModel):
+    email: str
+    ip: str
 
 
 MINIMUM_TICKET_DATA_MESSAGE = (
@@ -227,9 +276,326 @@ def health(request: Request) -> dict:
     return envelope({"status": "ok"}, request)
 
 
+@app.post("/api/auth/login")
+def login(body: LoginInput, request: Request, db: Session = Depends(get_session)):
+    email = normalized_email(body.email)
+    ip = client_ip(request)
+    if db.bind.dialect.name == "postgresql":
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+            {"key": f"{ip}:{email}"},
+        )
+    attempt = db.scalar(
+        select(LoginAttempt)
+        .where(LoginAttempt.ip == ip, LoginAttempt.email_normalized == email)
+        .with_for_update()
+    )
+    if attempt and attempt.locked_at and not attempt.unlocked_at:
+        return failure(request, "LOGIN_LOCKED", 429)
+    user = db.scalar(select(User).where(User.email == email))
+    if (
+        user is None
+        or not user.is_active
+        or not verify_password(body.password, user.password_hash)
+    ):
+        if attempt is None:
+            attempt = LoginAttempt(ip=ip, email_normalized=email, failed_count=0)
+            db.add(attempt)
+        attempt.failed_count += 1
+        attempt.last_failed_at = utc_now()
+        if attempt.failed_count >= 5:
+            attempt.locked_at = utc_now()
+            attempt.unlocked_at = None
+        db.add(
+            AuthAudit(
+                action="login_locked"
+                if attempt.locked_at and not attempt.unlocked_at
+                else "login_failed",
+                target_id=user.user_id if user else None,
+                ip=ip,
+            )
+        )
+        db.commit()
+        return failure(request, "INVALID_CREDENTIALS", 401)
+    if attempt:
+        attempt.failed_count = 0
+        attempt.locked_at = None
+        attempt.unlocked_at = None
+    db.add(
+        AuthAudit(
+            action="login_success", actor_id=user.user_id, target_id=user.user_id, ip=ip
+        )
+    )
+    db.commit()
+    response = JSONResponse(envelope({"user": user_data(user)}, request))
+    set_session_cookie(response, user)
+    return response
+
+
+@app.get("/api/auth/me")
+def me(request: Request, user: User = Depends(current_user)) -> dict:
+    return envelope({"user": user_data(user)}, request)
+
+
+@app.post("/api/auth/logout")
+def logout(
+    request: Request,
+    db: Session = Depends(get_session),
+    _: User = Depends(current_user),
+):
+    claims = request.state.session_claims
+    db.execute(delete(RevokedSession).where(RevokedSession.expires_at <= utc_now()))
+    db.add(
+        RevokedSession(
+            jti=claims["jti"],
+            expires_at=datetime.fromtimestamp(claims["exp"], timezone.utc),
+        )
+    )
+    db.commit()
+    response = JSONResponse(envelope({}, request))
+    response.delete_cookie("session", path="/", httponly=True, samesite="strict")
+    return response
+
+
+@app.post("/api/auth/change-password")
+def change_password(
+    body: ChangePasswordInput,
+    request: Request,
+    db: Session = Depends(get_session),
+    user: User = Depends(current_user),
+):
+    validate_password(body.new_password)
+    if body.new_password == body.current_password or not verify_password(
+        body.current_password, user.password_hash
+    ):
+        raise HTTPException(422, "INVALID_PASSWORD_CHANGE")
+    user.password_hash = hasher.hash(body.new_password)
+    user.password_changed_at = utc_now()
+    user.must_change_password = False
+    db.add(
+        AuthAudit(
+            action="password_changed",
+            actor_id=user.user_id,
+            target_id=user.user_id,
+            ip=client_ip(request),
+        )
+    )
+    db.commit()
+    response = JSONResponse(envelope({"user": user_data(user)}, request))
+    set_session_cookie(response, user)
+    return response
+
+
+def user_admin_data(user: User, db: Session) -> dict:
+    locks = db.scalars(
+        select(LoginAttempt).where(
+            LoginAttempt.email_normalized == user.email,
+            LoginAttempt.locked_at.is_not(None),
+            LoginAttempt.unlocked_at.is_(None),
+        )
+    ).all()
+    return {
+        **user_data(user),
+        "is_active": user.is_active,
+        "created_at": user.created_at,
+        "updated_at": user.updated_at,
+        "login_locked": bool(locks),
+        "login_locks": [{"ip": lock.ip, "locked_at": lock.locked_at} for lock in locks],
+    }
+
+
+@app.get("/api/admin/users")
+def list_users(
+    request: Request,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    role: str | None = None,
+    is_active: bool | None = None,
+    search: str | None = None,
+    db: Session = Depends(get_session),
+    _: User = Depends(require_admin),
+) -> dict:
+    query = select(User)
+    if role:
+        query = query.where(User.role == role)
+    if is_active is not None:
+        query = query.where(User.is_active == is_active)
+    if search:
+        query = query.where(
+            User.email.ilike(f"%{search}%") | User.display_name.ilike(f"%{search}%")
+        )
+    users = db.scalars(
+        query.order_by(User.created_at.desc()).limit(limit).offset(offset)
+    ).all()
+    total = db.scalar(select(func.count()).select_from(query.subquery()))
+    return envelope(
+        {"items": [user_admin_data(user, db) for user in users], "total": total},
+        request,
+    )
+
+
+@app.get("/api/admin/users/{user_id}")
+def get_user(
+    user_id: str,
+    request: Request,
+    db: Session = Depends(get_session),
+    _: User = Depends(require_admin),
+) -> dict:
+    user = db.get(User, identifier(user_id))
+    if user is None:
+        raise HTTPException(404, "USER_NOT_FOUND")
+    return envelope(user_admin_data(user, db), request)
+
+
+@app.post("/api/admin/users", status_code=201)
+def create_user(
+    body: CreateUserInput,
+    request: Request,
+    db: Session = Depends(get_session),
+    admin: User = Depends(require_admin),
+) -> dict:
+    email = normalized_email(body.email)
+    if db.scalar(select(User.user_id).where(User.email == email)):
+        raise HTTPException(409, "EMAIL_TAKEN")
+    user = User(
+        email=email,
+        display_name=body.display_name.strip(),
+        role=body.role,
+        password_hash=hasher.hash(body.temporary_password),
+        password_changed_at=utc_now(),
+        created_by=admin.user_id,
+    )
+    db.add(user)
+    db.flush()
+    db.add(
+        AuthAudit(
+            action="user_created",
+            actor_id=admin.user_id,
+            target_id=user.user_id,
+            ip=client_ip(request),
+        )
+    )
+    db.commit()
+    return envelope(user_admin_data(user, db), request)
+
+
+@app.patch("/api/admin/users/{user_id}")
+def update_user(
+    user_id: str,
+    body: UpdateUserInput,
+    request: Request,
+    db: Session = Depends(get_session),
+    admin: User = Depends(require_admin),
+) -> dict:
+    user = db.get(User, identifier(user_id))
+    if user is None:
+        raise HTTPException(404, "USER_NOT_FOUND")
+    if user.user_id == admin.user_id and body.is_active is False:
+        raise HTTPException(409, "SELF_DEACTIVATION")
+    if (
+        user.user_id == admin.user_id
+        and body.role is not None
+        and body.role != user.role
+    ):
+        raise HTTPException(409, "SELF_ROLE_CHANGE")
+    if (
+        user.is_active
+        and user.role == "admin"
+        and (body.is_active is False or body.role == "user")
+    ):
+        db.scalars(
+            select(User)
+            .where(User.is_active.is_(True), User.role == "admin")
+            .with_for_update()
+        ).all()
+        active_admins = db.scalar(
+            select(func.count())
+            .select_from(User)
+            .where(User.is_active.is_(True), User.role == "admin")
+        )
+        if active_admins <= 1:
+            raise HTTPException(409, "LAST_ADMIN")
+    if body.display_name is not None:
+        user.display_name = body.display_name.strip()
+    if body.role is not None:
+        user.role = body.role
+    if body.is_active is not None:
+        user.is_active = body.is_active
+    user.updated_at = utc_now()
+    db.add(
+        AuthAudit(
+            action="user_updated",
+            actor_id=admin.user_id,
+            target_id=user.user_id,
+            ip=client_ip(request),
+        )
+    )
+    db.commit()
+    return envelope(user_admin_data(user, db), request)
+
+
+@app.post("/api/admin/users/{user_id}/reset-password")
+def reset_password(
+    user_id: str,
+    body: ResetPasswordInput,
+    request: Request,
+    db: Session = Depends(get_session),
+    admin: User = Depends(require_admin),
+) -> dict:
+    user = db.get(User, identifier(user_id))
+    if user is None:
+        raise HTTPException(404, "USER_NOT_FOUND")
+    user.password_hash = hasher.hash(body.temporary_password)
+    user.password_changed_at = utc_now()
+    user.must_change_password = True
+    db.add(
+        AuthAudit(
+            action="password_reset",
+            actor_id=admin.user_id,
+            target_id=user.user_id,
+            ip=client_ip(request),
+        )
+    )
+    db.commit()
+    return envelope(user_admin_data(user, db), request)
+
+
+@app.post("/api/admin/login-locks/unlock")
+def unlock_login(
+    body: UnlockInput,
+    request: Request,
+    db: Session = Depends(get_session),
+    admin: User = Depends(require_admin),
+) -> dict:
+    attempt = db.scalar(
+        select(LoginAttempt).where(
+            LoginAttempt.ip == body.ip,
+            LoginAttempt.email_normalized == normalized_email(body.email),
+            LoginAttempt.locked_at.is_not(None),
+            LoginAttempt.unlocked_at.is_(None),
+        )
+    )
+    if attempt is None:
+        raise HTTPException(404, "LOGIN_LOCK_NOT_FOUND")
+    attempt.unlocked_at = utc_now()
+    attempt.unlocked_by = admin.user_id
+    attempt.failed_count = 0
+    db.add(
+        AuthAudit(
+            action="login_unlocked", actor_id=admin.user_id, ip=client_ip(request)
+        )
+    )
+    db.commit()
+    return envelope({}, request)
+
+
 @app.post("/api/chat/sessions", status_code=201)
-def create_session(request: Request, db: Session = Depends(get_session)) -> dict:
-    record = ChatSession()
+def create_session(
+    request: Request,
+    db: Session = Depends(get_session),
+    user: User = Depends(current_user),
+) -> dict:
+    record = ChatSession(user_id=user.user_id)
     db.add(record)
     db.commit()
     db.refresh(record)
@@ -251,6 +617,7 @@ def post_message(
     request: Request,
     idempotency_key: str | None = Header(None, max_length=128),
     db: Session = Depends(get_session),
+    user: User = Depends(current_user),
 ):
     session_id = identifier(session_id)
     text = body.message_text.strip()
@@ -260,7 +627,9 @@ def post_message(
     request_hash = sha256(safe_text.encode()).hexdigest()
     record = db.scalar(
         select(ChatSession)
-        .where(ChatSession.session_id == session_id)
+        .where(
+            ChatSession.session_id == session_id, ChatSession.user_id == user.user_id
+        )
         .with_for_update()
     )
     if record is None:
@@ -580,12 +949,54 @@ def post_message(
     return envelope(turn, request, run.agent_run_id)
 
 
+@app.get("/api/chat/sessions")
+def list_own_sessions(
+    request: Request,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_session),
+    user: User = Depends(current_user),
+) -> dict:
+    own = ChatSession.user_id == user.user_id
+    records = db.scalars(
+        select(ChatSession)
+        .where(own)
+        .order_by(ChatSession.updated_at.desc(), ChatSession.session_id)
+        .limit(limit)
+        .offset(offset)
+    ).all()
+    return envelope(
+        {
+            "items": [
+                {
+                    "session_id": record.session_id,
+                    "status": record.status,
+                    "created_at": record.created_at,
+                    "updated_at": record.updated_at,
+                }
+                for record in records
+            ],
+            "total": db.scalar(
+                select(func.count()).select_from(ChatSession).where(own)
+            ),
+        },
+        request,
+    )
+
+
 @app.get("/api/chat/sessions/{session_id}")
 def get_chat_session(
-    session_id: str, request: Request, db: Session = Depends(get_session)
+    session_id: str,
+    request: Request,
+    db: Session = Depends(get_session),
+    user: User = Depends(current_user),
 ) -> dict:
     session_id = identifier(session_id)
-    record = db.get(ChatSession, session_id)
+    record = db.scalar(
+        select(ChatSession).where(
+            ChatSession.session_id == session_id, ChatSession.user_id == user.user_id
+        )
+    )
     if record is None:
         raise HTTPException(404, "SESSION_NOT_FOUND")
     messages = db.scalars(
@@ -634,7 +1045,7 @@ def list_conversations(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_session),
-    _: None = Depends(local_admin),
+    _: User = Depends(require_admin),
 ) -> dict:
     activities = union_all(
         select(ChatSession.session_id, ChatSession.updated_at.label("at")),
@@ -664,7 +1075,8 @@ def list_conversations(
     ).subquery()
     total = db.scalar(select(func.count()).select_from(ChatSession)) or 0
     rows = db.execute(
-        select(ChatSession, last_activity.c.at, ranked_runs)
+        select(ChatSession, User, last_activity.c.at, ranked_runs)
+        .join(User, User.user_id == ChatSession.user_id)
         .join(last_activity, last_activity.c.session_id == ChatSession.session_id)
         .outerjoin(
             ranked_runs,
@@ -680,6 +1092,7 @@ def list_conversations(
             "items": [
                 {
                     "session_id": record.session_id,
+                    "owner": {"display_name": owner.display_name, "email": owner.email},
                     "status": record.status,
                     "created_at": utc_iso(record.created_at),
                     "updated_at": utc_iso(record.updated_at),
@@ -692,7 +1105,9 @@ def list_conversations(
                     if run_status is not None
                     else None,
                 }
-                for record, activity, _, run_status, final_action, error_code, _ in rows
+                for (
+                    record, owner, activity, _, run_status, final_action, error_code, _
+                ) in rows
             ],
             "total": total,
         },
@@ -707,7 +1122,7 @@ def get_admin_conversation(
     session_id: str,
     request: Request,
     db: Session = Depends(get_session),
-    _: None = Depends(local_admin),
+    _: User = Depends(require_admin),
 ) -> dict:
     session_id = identifier(session_id)
     record = db.get(ChatSession, session_id)
@@ -731,6 +1146,10 @@ def get_admin_conversation(
     return envelope(
         {
             "session_id": session_id,
+            "owner": {
+                "display_name": db.get(User, record.user_id).display_name,
+                "email": db.get(User, record.user_id).email,
+            },
             "status": record.status,
             "created_at": utc_iso(record.created_at),
             "updated_at": utc_iso(record.updated_at),
@@ -787,7 +1206,7 @@ def get_admin_conversation(
     )
 
 
-@app.get("/api/tickets")
+@app.get("/api/tickets", dependencies=[Depends(require_admin)])
 def list_tickets(
     request: Request,
     limit: int = Query(20, ge=1, le=100),
@@ -809,7 +1228,7 @@ def list_tickets(
     )
 
 
-@app.get("/api/tickets/{ticket_id}")
+@app.get("/api/tickets/{ticket_id}", dependencies=[Depends(require_admin)])
 def get_ticket(
     ticket_id: str, request: Request, db: Session = Depends(get_session)
 ) -> dict:
@@ -824,7 +1243,7 @@ def get_admin_ticket(
     ticket_id: str,
     request: Request,
     db: Session = Depends(get_session),
-    _: None = Depends(local_admin),
+    _: User = Depends(require_admin),
 ) -> dict:
     ticket = db.get(Ticket, identifier(ticket_id))
     if ticket is None:
@@ -832,7 +1251,7 @@ def get_admin_ticket(
     return envelope(ticket_data(ticket, include_payload=True), request)
 
 
-@app.get("/api/agent-runs/{agent_run_id}")
+@app.get("/api/agent-runs/{agent_run_id}", dependencies=[Depends(require_admin)])
 def get_run(
     agent_run_id: str, request: Request, db: Session = Depends(get_session)
 ) -> dict:
@@ -871,7 +1290,7 @@ def get_run(
     )
 
 
-@app.get("/api/metrics/summary")
+@app.get("/api/metrics/summary", dependencies=[Depends(require_admin)])
 def metrics(request: Request, db: Session = Depends(get_session)) -> dict:
     def count(statement):
         return db.scalar(statement) or 0
@@ -907,7 +1326,7 @@ def metrics(request: Request, db: Session = Depends(get_session)) -> dict:
     )
 
 
-@app.get("/api/knowledge/sources")
+@app.get("/api/knowledge/sources", dependencies=[Depends(require_admin)])
 def knowledge_sources(request: Request, db: Session = Depends(get_session)) -> dict:
     sync_catalog(db)
     sources = db.scalars(select(KnowledgeSource).order_by(KnowledgeSource.path)).all()
@@ -929,4 +1348,4 @@ def knowledge_sources(request: Request, db: Session = Depends(get_session)) -> d
 
 from app.ia_tab import router as ia_router  # noqa: E402
 
-app.include_router(ia_router, dependencies=[Depends(local_admin)])
+app.include_router(ia_router, dependencies=[Depends(require_admin)])

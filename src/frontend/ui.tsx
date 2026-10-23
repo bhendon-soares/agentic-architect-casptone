@@ -1,4 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react'
+import { LogOut } from 'lucide-react'
+import type { AuthUser } from './chatApi'
 
 export type Tone = 'success' | 'info' | 'warning' | 'danger' | 'neutral'
 type Theme = 'system' | 'light' | 'dark'
@@ -25,6 +27,19 @@ export function ThemeToggle() {
         try { localStorage.setItem(themeKey, value) } catch { /* Storage may be disabled. */ }
     }
     return <label className="theme-choice">Tema <select aria-label="Tema" value={theme} onChange={(event) => change(event.target.value as Theme)}><option value="system">Sistema</option><option value="light">Claro</option><option value="dark">Escuro</option></select></label>
+}
+
+export function SiteHeader({ user, onLogout, admin = false }: { user?: AuthUser | null; onLogout?: () => void; admin?: boolean }) {
+    const displayName = user?.display_name.toLocaleLowerCase('pt-BR').replace(/(^|[\s'-])(\p{L})/gu, (_, prefix: string, letter: string) => prefix + letter.toLocaleUpperCase('pt-BR'))
+    return <header className="topbar">
+        <a className="brand" href="/" aria-label="Help Desk TI Multi Agent MVP - voltar ao chat"><span className="brand-mark" aria-hidden="true">S/</span><span>Help Desk TI Multi Agent MVP</span></a>
+        {user && <span className="demo-label topbar-demo">DEMONSTRAÇÃO · DADOS FICTÍCIOS</span>}
+        <div className="topbar-actions">
+            {user && (admin || user.role === 'admin') && <a className="topbar-link" href={admin ? '/' : '/admin'}>{admin ? 'Voltar ao chat' : 'Console admin'}</a>}
+            <ThemeToggle />
+            {user && <div className="account-actions"><span className="account-name" title={displayName}>{displayName}</span><button type="button" className="logout-button" onClick={onLogout} title="Encerrar sessão" aria-label="Sair"><LogOut size={17} aria-hidden="true" /></button></div>}
+        </div>
+    </header>
 }
 
 export function formatDate(value: string | null | undefined): string {

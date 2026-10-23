@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { createSession, getSession, sendMessage, type ChatHistory, type RunError, type RunInput, type RunResult, type RunStatus } from './chatApi'
-import { formatDate, StatusBadge, ThemeToggle } from './ui'
+import { createSession, getSession, listOwnSessions, sendMessage, type AuthUser, type ChatHistory, type RunError, type RunInput, type RunResult, type RunStatus } from './chatApi'
+import { formatDate, SiteHeader, StatusBadge } from './ui'
 import './style.css'
 
 type Message = { id: number; role: 'user'; text: string } | { id: number; role: 'assistant'; result: RunResult } | { id: number; role: 'notice'; text: string }
@@ -45,14 +45,15 @@ function historyMessages(history: ChatHistory): Message[] {
   })
 }
 
-export default function App() {
+export default function App({ user, onLogout, notice }: { user?: AuthUser; onLogout?: () => void; notice?: string }) {
   const [draft, setDraft] = useState('')
   const [messages, setMessages] = useState<Message[]>([])
   const [status, setStatus] = useState<RunStatus>('idle')
   const [outcomeLabel, setOutcomeLabel] = useState<string | null>(null)
   const [error, setError] = useState<RunError | null>(null)
+  const [toast, setToast] = useState(notice)
   const [failedTurn, setFailedTurn] = useState<FailedTurn | null>(null)
-  const [sessions, setSessions] = useState<string[]>(storedSessions)
+  const [sessions, setSessions] = useState<string[]>(user ? [] : storedSessions)
   const [sessionTitles, setSessionTitles] = useState<Record<string, string>>({})
   const [navOpen, setNavOpen] = useState(true)
   const [reviewSessions, setReviewSessions] = useState<string[]>(storedReviewSessions)
@@ -62,19 +63,44 @@ export default function App() {
   const nextId = useRef(0)
   const activeSession = useRef<string | null>(null)
   const conversationRef = useRef<HTMLElement>(null)
+  const resetDialog = useRef<HTMLDialogElement>(null)
 
   useEffect(() => {
-    if (sessions.length) void selectSession(sessions[0])
+    if (user) {
+      void (async () => {
+        try {
+          const ids: string[] = []
+          let total: number
+          do {
+            const page = await listOwnSessions(100, ids.length)
+            ids.push(...page.items.map((item) => item.session_id))
+            total = page.total
+            if (!page.items.length) break
+          } while (ids.length < total)
+          setSessions(ids)
+          if (ids.length) void selectSession(ids[0])
+        } catch (cause) {
+          setError(cause as RunError)
+        }
+      })()
+    } else if (sessions.length) void selectSession(sessions[0])
   }, [])
 
   useEffect(() => {
     if (conversationRef.current) conversationRef.current.scrollTop = conversationRef.current.scrollHeight
   }, [messages, status])
 
+  useEffect(() => {
+    setToast(notice)
+    if (!notice) return
+    const timeout = window.setTimeout(() => setToast(''), 5000)
+    return () => window.clearTimeout(timeout)
+  }, [notice])
+
   function rememberSession(id: string) {
     setSessions((current) => {
       const updated = [id, ...current.filter((entry) => entry !== id)]
-      localStorage.setItem(sessionsKey, JSON.stringify(updated))
+      if (!user) localStorage.setItem(sessionsKey, JSON.stringify(updated))
       return updated
     })
   }
@@ -139,9 +165,12 @@ export default function App() {
     void execute({ message_text: draft })
   }
 
-  async function reset() {
+  async function reset(confirmed = false) {
     if (running.current) return
-    if (activeSession.current && reviewSessions.includes(activeSession.current) && !window.confirm(error?.code === 'TICKET_CREATE_FAILED' ? 'A criação do incidente falhou. Consulte o registro local antes de solicitar outro. Iniciar uma nova conversa?' : 'A tentativa anterior pode ter criado um incidente. Consulte o suporte antes de solicitar outro. Iniciar uma nova conversa?')) return
+    if (!confirmed && activeSession.current && reviewSessions.includes(activeSession.current)) {
+      resetDialog.current?.showModal()
+      return
+    }
     running.current = true
     updateStatus('running')
     try {
@@ -199,14 +228,10 @@ export default function App() {
 
   return (
     <div className="app-shell chat-shell">
-      <header className="topbar">
-        <a className="brand" href="/" aria-label="Help Desk TI Multi Agent MVP - voltar ao chat"><span className="brand-mark" aria-hidden="true">S/</span><span>Help Desk TI Multi Agent MVP</span></a>
-        <a className="topbar-link" href="/admin">Console admin</a>
-        <ThemeToggle />
-        <span className="demo-label">DEMONSTRAÇÃO · DADOS FICTÍCIOS</span>
-      </header>
+      <SiteHeader user={user} onLogout={onLogout} />
 
       <main className="workspace">
+        {toast && <p className="app-toast" role="alert">{toast}</p>}
         {sessions.length > 0 && <nav className={`session-nav ${navOpen ? '' : 'collapsed'}`} aria-label="Conversas anteriores">
           <button type="button" className="nav-toggle" aria-expanded={navOpen} aria-label={navOpen ? 'Recolher conversas' : 'Mostrar conversas'} onClick={() => setNavOpen(!navOpen)}>{navOpen ? '‹' : '›'}<span>Conversas</span></button>
           {navOpen && sessions.map((id) => <button type="button" key={id} title={sessionTitles[id] || id} aria-current={sessionId === id ? 'page' : undefined} disabled={status === 'running'} onClick={() => void selectSession(id)}>{sessionTitles[id] || id.slice(0, 8)}</button>)}
@@ -247,6 +272,11 @@ export default function App() {
           <p className="privacy-note">Não informe senhas, tokens ou credenciais neste chat.</p>
         </div>
       </main>
+      <dialog ref={resetDialog} className="users-dialog" aria-labelledby="reset-dialog-title">
+        <h2 id="reset-dialog-title">Iniciar nova conversa?</h2>
+        <p>{error?.code === 'TICKET_CREATE_FAILED' ? 'A criação do incidente falhou. Consulte o registro local antes de solicitar outro.' : 'A tentativa anterior pode ter criado um incidente. Consulte o suporte antes de solicitar outro.'}</p>
+        <div className="users-dialog-actions"><button type="button" onClick={() => resetDialog.current?.close()}>Cancelar</button><button type="button" className="admin-command" onClick={() => { resetDialog.current?.close(); void reset(true) }}>Nova conversa</button></div>
+      </dialog>
     </div>
   )
 }

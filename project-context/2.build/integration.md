@@ -1,5 +1,15 @@
 # Integracao do chat P0
 
+## Estado atual: RBAC, logout e historico autenticado
+
+Esta secao substitui as afirmacoes historicas abaixo sobre "sem RBAC", protecao somente por loopback e ausencia de listagem de sessoes. As secoes datadas anteriores registram o estado da integracao antes da adicao de identidades locais; nao sao instrucoes para implantar a versao atual.
+
+- A API exige sessao autenticada para chat, tickets, metricas e console; rotas administrativas exigem `admin`. A dependencia `current_user` valida assinatura e expiracao do JWT, consulta usuario ativo e papel atual no banco e invalida tokens anteriores a troca de senha. O cookie de sessao e `HttpOnly`, `SameSite=Strict` e `Secure` salvo configuracao local de desenvolvimento. O cliente chama a API na mesma origem e envia `Origin` nas mutacoes.
+- `POST /api/auth/logout` persiste o `jti` ate a expiracao do JWT e somente depois apaga o cookie. `current_user` rejeita um token revogado com 401 `INVALID_TOKEN`, inclusive se o cookie antigo for reapresentado; outras sessoes do usuario continuam validas. Registros expirados sao removidos no logout seguinte. Se o logout falhar, a interface permanece autenticada e exibe um erro para nova tentativa, sem redirecionar como se a sessao tivesse terminado.
+- Antes de iniciar o backend atualizado contra banco persistente, executar `cd src/backend && ../../.venv/bin/dotenv -f ../../.env run -- ../../.venv/bin/alembic upgrade head` (revisao `20261022_03`). Sem a tabela `revoked_sessions`, a verificacao de autenticacao nao pode funcionar. Nao remover a tabela enquanto tokens emitidos ainda estiverem validos.
+- `GET /api/chat/sessions` retorna somente conversas do usuario autenticado, com `items`, `total`, `limit` (ate 100) e `offset`. O chat percorre as paginas de 100 ate carregar as conversas do usuario, inclusive as posteriores a primeira pagina, e restaura a mais recente. IDs em `localStorage` sao usados somente pelo fluxo legado sem usuario, nao como autoridade de acesso.
+- Cobertura automatizada: replay do JWT apos logout, preservacao de outra sessao, subida/reversao da migracao, falha de rede no logout sem perda da tela autenticada e historico com 101 sessoes. Esses testes usam SQLite isolado e respostas HTTP simuladas; nao comprovam deploy da migracao no PostgreSQL nem um fluxo de navegador com ambiente real.
+
 ## Custo do novo modelo OpenAI na aba IA (2026-10-22)
 
 Com `.env` local configurado para `LLM_MODEL=openai/gpt-4.1-mini` e `OPENAI_API_KEY`, executar `cd src/backend && ../../.venv/bin/dotenv -f ../../.env run -- ../../.venv/bin/alembic upgrade head` e reiniciar o backend. Nao expor o `.env` nem publicar o console/proxy fora de loopback. A revisao `20261022_01` ativa a tarifa padrao OpenAI direta, USD/milhao de tokens: entrada 0,40; cache 0,10; saida 1,60. A vigencia comeca no instante da migracao; ela nao reprecifica o historico. Conferir valores atuais/contrato em https://developers.openai.com/api/docs/pricing antes de usar estimativas para decisoes financeiras.
@@ -117,14 +127,14 @@ O teste usou o backend ativo (8000, `TICKET_ADAPTER_MODE=servicenow`, OAuth pass
 
 ## Assumptions
 
-- Runtime selecionado: `crewai` em `aamad.config.yml`. API no host local na porta 8000; dados da demo sao ficticios. O backend permanece autoridade de `final_action` e da persistencia. Sem autenticacao: somente demo local controlada.
+- Runtime selecionado: `crewai` em `aamad.config.yml`. API no host local na porta 8000; dados da demo sao ficticios. O backend permanece autoridade de `final_action` e da persistencia. A nota "sem autenticacao" descrevia apenas o estado de 2026-10-15; ver estado atual no topo.
 
-- 2026-10-21: console admin e rotas admin continuam acessiveis so por loopback, sem RBAC. Vite escuta em `127.0.0.1` e o proxy nao repassa a origem real; publicar o Vite (`--host`) ou um proxy externo faria clientes remotos parecerem loopback. O ticket mock `MOCK784591C6` e as conversas de teste ficaram no banco de demonstracao local.
+- 2026-10-21 (historico, substituido): console admin e rotas admin eram acessiveis so por loopback, sem RBAC. Na versao atual, exigem autenticacao e papel `admin`. O ticket mock `MOCK784591C6` e as conversas de teste ficaram no banco de demonstracao local.
 
 ## Open Questions
 
 - Obter revisao formal de produto sobre o contrato 422 aprovado pelo operador, executar QA e revisao de seguranca antes do aceite P0. Repetir em avaliacoes formais a estabilidade do ajuste de QA com provider real; falha/incerteza reais no ServiceNow permanecem deliberadamente nao provocadas.
-- Sessao acessivel em outro navegador/dispositivo exigiria listagem/autenticacao de sessoes, fora do contrato P0. Janela de timeout HTTP e reconciliacao de incidentes incertos requerem acordo com backend/seguranca.
+- A pendencia historica de listagem/autenticacao de sessoes em outro navegador foi resolvida para conversas do proprio usuario; janela de timeout HTTP e reconciliacao de incidentes incertos ainda requerem acordo com backend/seguranca.
 - A chave da tentativa pendente permanece somente na memoria da aba; recarregar durante erro incerto perde o retry correlacionado. Consultar suporte/registro local antes de iniciar novo envio nessa situacao.
 
 - 2026-10-21: definir com `@product-mgr` se pedidos explicitos de ticket no primeiro turno devem ser aprovados pelo `QAPolicyAgent` (hoje falham de forma intermitente com `POLICY_UNAPPROVED`), e se o motivo da politica deve ser persistido em evento seguro para diagnostico.

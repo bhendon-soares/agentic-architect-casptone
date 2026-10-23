@@ -1,4 +1,6 @@
 export type RunInput = { message_text: string }
+export type AuthUser = { user_id: string; email: string; display_name: string; role: 'user' | 'admin'; must_change_password: boolean }
+export type ManagedUser = AuthUser & { is_active: boolean; created_at: string; updated_at: string; login_locked: boolean; login_locks: { ip: string; locked_at: string }[] }
 export type RunStatus = 'idle' | 'running' | 'done'
 export type FinalAction = 'respond' | 'ask_clarification' | 'open_ticket' | 'blocked'
 export type RunError = { code: string; message: string; retryable: boolean }
@@ -19,6 +21,7 @@ export type ChatHistory = {
 
 export type AdminConversation = {
     session_id: string
+    owner?: { display_name: string; email: string }
     status: string
     created_at: string
     updated_at: string
@@ -28,6 +31,7 @@ export type AdminConversation = {
 export type AdminConversationPage = { items: AdminConversation[]; total: number }
 export type AdminConversationDetail = {
     session_id: string
+    owner?: { display_name: string; email: string }
     status: string
     created_at: string
     updated_at: string
@@ -147,7 +151,9 @@ type ApiIaTimeseries = {
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
     let response: Response
     try {
-        response = await fetch(path, options)
+        response = await fetch(path, options?.method && options.method !== 'GET' ? {
+            ...options, credentials: 'same-origin', headers: { Origin: window.location.origin, ...options.headers },
+        } : options ? { ...options, credentials: 'same-origin' } : undefined)
     } catch {
         throw { code: 'NETWORK_ERROR', message: 'Não foi possível conectar ao atendimento.', retryable: true } satisfies RunError
     }
@@ -158,11 +164,31 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     } catch {
         throw { code: 'INVALID_RESPONSE', message: 'Resposta inválida do atendimento.', retryable: true } satisfies RunError
     }
+    if (response.status === 401 && path !== '/api/auth/login' && path !== '/api/auth/me') window.dispatchEvent(new Event('auth-expired'))
     if (!response.ok || envelope.error || !envelope.data) {
         throw envelope.error ?? { code: 'INVALID_RESPONSE', message: 'Resposta inválida do atendimento.', retryable: true } satisfies RunError
     }
     return envelope.data
 }
+
+export const getCurrentUser = () => request<{ user: AuthUser }>('/api/auth/me').then(({ user }) => user)
+export const loginUser = (email: string, password: string) => request<{ user: AuthUser }>('/api/auth/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password }),
+}).then(({ user }) => user)
+export const logoutUser = () => request<object>('/api/auth/logout', { method: 'POST' })
+export const changePassword = (current_password: string, new_password: string) => request<{ user: AuthUser }>('/api/auth/change-password', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ current_password, new_password }),
+}).then(({ user }) => user)
+export const listOwnSessions = (limit = 100, offset = 0) => request<{ items: { session_id: string }[]; total: number }>(`/api/chat/sessions?limit=${limit}&offset=${offset}`)
+export const listUsers = (query: string) => request<{ items: ManagedUser[]; total: number }>(`/api/admin/users?${query}`)
+export const createUser = (input: { email: string; display_name: string; role: 'user' | 'admin'; temporary_password: string }) =>
+    request<ManagedUser>('/api/admin/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) })
+export const updateUser = (id: string, input: Partial<Pick<ManagedUser, 'display_name' | 'role' | 'is_active'>>) =>
+    request<ManagedUser>(`/api/admin/users/${encodeURIComponent(id)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) })
+export const resetUserPassword = (id: string, temporary_password: string) =>
+    request<ManagedUser>(`/api/admin/users/${encodeURIComponent(id)}/reset-password`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ temporary_password }) })
+export const unlockLogin = (email: string, ip: string) =>
+    request<object>('/api/admin/login-locks/unlock', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, ip }) })
 
 export async function createSession(): Promise<string> {
     const session = await request<{ session_id: string }>('/api/chat/sessions', {

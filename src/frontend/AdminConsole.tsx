@@ -1,10 +1,11 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import {
     getAdminConversation, getAdminConversations, getAdminTicket, getAgentRun, getKnowledgeSources, getMetrics, getTickets,
-    type AdminConversation, type AdminConversationDetail, type AdminConversationPage, type AdminTicket, type AgentRun, type KnowledgeSource, type Metrics, type RunError, type TicketPage,
+    type AdminConversation, type AdminConversationDetail, type AdminConversationPage, type AdminTicket, type AgentRun, type AuthUser, type KnowledgeSource, type Metrics, type RunError, type TicketPage,
 } from './chatApi'
 import IaPanel from './IaPanel'
-import { ErrorCodeLabel, formatDate, formatNumber, IdChip, KpiCard, StatusBadge, ThemeToggle, type Tone } from './ui'
+import UsersPanel from './UsersPanel'
+import { ErrorCodeLabel, formatDate, formatNumber, IdChip, KpiCard, SiteHeader, StatusBadge, type Tone } from './ui'
 import './style.css'
 
 const pageSize = 20
@@ -28,8 +29,8 @@ const conversationStatusLabels: Record<string, string> = {
     active: 'Ativa', completed: 'Concluída', running: 'Em andamento', failed: 'Falhou', blocked: 'Bloqueado',
 }
 const categoryLabels: Record<string, string> = { password_reset: 'Redefinição de senha', app_access: 'Acesso a aplicativo' }
-type Tab = 'overview' | 'conversations' | 'tickets' | 'knowledge' | 'ia'
-const tabs: { id: Tab; label: string }[] = [{ id: 'overview', label: 'Visão geral' }, { id: 'conversations', label: 'Conversas' }, { id: 'tickets', label: 'Tickets' }, { id: 'knowledge', label: 'Conhecimento' }, { id: 'ia', label: 'IA' }]
+type Tab = 'overview' | 'conversations' | 'tickets' | 'knowledge' | 'ia' | 'users'
+const tabs: { id: Tab; label: string }[] = [{ id: 'overview', label: 'Visão geral' }, { id: 'conversations', label: 'Conversas' }, { id: 'tickets', label: 'Tickets' }, { id: 'knowledge', label: 'Conhecimento' }, { id: 'ia', label: 'IA' }, { id: 'users', label: 'Usuários' }]
 
 function conversationState(conversation: AdminConversation): { label: string; tone: Tone } {
     const status = conversation.last_run?.run_status === 'outcome_unknown' ? 'outcome_unknown' : conversation.last_run?.run_status === 'failed' ? 'failed' : conversation.last_run?.final_action || conversation.last_run?.run_status || conversation.status
@@ -45,7 +46,7 @@ function errorLabel(cause: unknown): string {
     return error?.message || 'Não foi possível carregar os dados. Tente novamente.'
 }
 
-export default function AdminConsole() {
+export default function AdminConsole({ user, onLogout }: { user?: AuthUser; onLogout?: () => void }) {
     const [tab, setTab] = useState<Tab>('overview')
     const [refreshedAt, setRefreshedAt] = useState<string | null>(null)
     const [metrics, setMetrics] = useState<Metrics | null>(null)
@@ -164,12 +165,7 @@ export default function AdminConsole() {
 
     return (
         <div className="app-shell">
-            <header className="topbar">
-                <a className="brand" href="/" aria-label="Help Desk TI Multi Agent MVP - voltar ao chat"><span className="brand-mark" aria-hidden="true">S/</span><span>Help Desk TI Multi Agent MVP</span></a>
-                <a className="topbar-link" href="/">Voltar ao chat</a>
-                <ThemeToggle />
-                <span className="demo-label">DEMONSTRAÇÃO · DADOS FICTÍCIOS</span>
-            </header>
+            <SiteHeader user={user} onLogout={onLogout} admin />
             <main className="admin-workspace">
                 <nav className="admin-tabs" aria-label="Visões do console">
                     {tabs.map((item) => <button type="button" key={item.id} aria-current={tab === item.id ? 'page' : undefined} onClick={() => setTab(item.id)}>{item.label}</button>)}
@@ -178,7 +174,7 @@ export default function AdminConsole() {
                     <div><p className="eyebrow">SUPORTE / CONSOLE</p><h1>{tabs.find((item) => item.id === tab)?.label}</h1>{tab === 'overview' && refreshedAt && <p>Atualizado em {dateLabel(refreshedAt)}</p>}</div>
                     {tab === 'overview' && <button type="button" className="admin-command" onClick={() => void refresh()} disabled={loading}>Atualizar dados</button>}
                 </div>
-                {tab === 'ia' ? <IaPanel onConversation={inspectConversation} onRun={inspectRun} /> : <>
+                {tab === 'users' && user ? <UsersPanel admin={user} /> : tab === 'ia' ? <IaPanel onConversation={inspectConversation} onRun={inspectRun} /> : <>
                     {error && <p role="alert" className="admin-error">{error}</p>}
                     {loading && <p role="status" className="admin-muted">Carregando dados…</p>}
 
@@ -200,7 +196,7 @@ export default function AdminConsole() {
                                 {conversations?.items.map((conversation) => {
                                     const state = conversationState(conversation)
                                     return <article className="admin-row" key={conversation.session_id}>
-                                        <div><strong>Conversa <IdChip id={conversation.session_id} /></strong><span className="admin-row-meta">{dateLabel(conversation.last_activity_at)} · <StatusBadge tone={state.tone}>{state.label}</StatusBadge> {<ErrorCodeLabel code={conversation.last_run?.error_code ?? null} />}</span></div>
+                                        <div><strong>Conversa <IdChip id={conversation.session_id} /></strong>{conversation.owner && <span className="admin-row-meta">{conversation.owner.display_name} · {conversation.owner.email}</span>}<span className="admin-row-meta">{dateLabel(conversation.last_activity_at)} · <StatusBadge tone={state.tone}>{state.label}</StatusBadge> {<ErrorCodeLabel code={conversation.last_run?.error_code ?? null} />}</span></div>
                                         <button type="button" className="admin-text-button" onClick={() => void openSession(conversation.session_id)}>Ver detalhes</button>
                                     </article>
                                 })}
@@ -257,6 +253,7 @@ export default function AdminConsole() {
                             </section>}
                             {history && <div className="admin-history">
                                 <p className="admin-id">Conversa <IdChip id={history.session_id} /></p>
+                                {history.owner && <p className="admin-muted">Solicitante: {history.owner.display_name} · {history.owner.email}</p>}
                                 <p className="admin-muted">{conversationStatusLabels[history.status] || history.status} · Criada em {dateLabel(history.created_at)} · Atualizada em {dateLabel(history.updated_at)}</p>
                                 {history.messages.length === 0 && <p className="admin-muted">Ainda não há mensagens.</p>}
                                 {history.messages.map((message) => <div className="admin-message" key={message.message_id}>

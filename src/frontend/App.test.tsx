@@ -1,7 +1,9 @@
 import { afterEach, expect, test, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import App from './App'
+import { AuthGate } from './main'
 import AdminConsole from './AdminConsole'
+import UsersPanel from './UsersPanel'
 
 afterEach(() => {
   cleanup()
@@ -139,6 +141,32 @@ test('loads a saved conversation after reopening the page', async () => {
   expect(fetchMock).toHaveBeenCalledWith('/api/chat/sessions/session-1', undefined)
 })
 
+test('loads all owned conversations beyond the first page', async () => {
+  const first = Array.from({ length: 100 }, (_, index) => ({ session_id: `session-${index}` }))
+  const fetchMock = vi.fn().mockResolvedValueOnce(reply({ items: first, total: 101 }))
+    .mockResolvedValueOnce(reply({ items: [{ session_id: 'session-100' }], total: 101 }))
+    .mockResolvedValueOnce(reply({ session_id: 'session-0', turns: [], messages: [] }))
+  vi.stubGlobal('fetch', fetchMock)
+  render(<App user={{ user_id: 'admin', email: 'admin@example.com', display_name: 'Admin', role: 'admin', must_change_password: false }} />)
+  expect(await screen.findByTitle('session-100')).toBeTruthy()
+  expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/chat/sessions?limit=100&offset=0', undefined)
+  expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/chat/sessions?limit=100&offset=100', undefined)
+  expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/chat/sessions/session-0', undefined)
+})
+
+test('keeps the user signed in and shows an error if logout fails', async () => {
+  const user = { user_id: 'admin', email: 'admin@example.com', display_name: 'Admin', role: 'admin', must_change_password: false }
+  const fetchMock = vi.fn().mockResolvedValueOnce(reply({ user }))
+    .mockResolvedValueOnce(reply({ items: [], total: 0 }))
+    .mockRejectedValueOnce(new Error('offline'))
+  vi.stubGlobal('fetch', fetchMock)
+  render(<AuthGate />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Sair' }))
+  expect(await screen.findByRole('alert')).toHaveProperty('textContent', 'Não foi possível encerrar a sessão. Tente novamente.')
+  expect(screen.getByRole('button', { name: 'Sair' })).toBeTruthy()
+  expect(fetchMock).toHaveBeenLastCalledWith('/api/auth/logout', expect.objectContaining({ method: 'POST' }))
+})
+
 test('keeps the missing-data outcome visible after reload without technical retry', async () => {
   const notice = 'Ainda faltam dados. Procure o suporte pelo canal oficial.'
   const history = {
@@ -230,15 +258,51 @@ test('allows a new message after a non-ticket API failure', async () => {
 test('requires an explicit warning acknowledgment before restarting an uncertain ticket', async () => {
   const fetchMock = vi.fn().mockResolvedValueOnce(reply({ session_id: 'session-1' }))
     .mockResolvedValueOnce(reply({ code: 'TICKET_OUTCOME_UNKNOWN', message: 'Resultado incerto.', retryable: false }, 504))
+    .mockResolvedValueOnce(reply({ session_id: 'session-2' }))
   vi.stubGlobal('fetch', fetchMock)
-  const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+  Object.defineProperties(HTMLDialogElement.prototype, {
+    showModal: { configurable: true, value: function (this: HTMLDialogElement) { this.setAttribute('open', '') } },
+    close: { configurable: true, value: function (this: HTMLDialogElement) { this.removeAttribute('open') } },
+  })
   render(<App />)
   submitMessage()
   expect(await screen.findByRole('alert')).toBeTruthy()
   fireEvent.click(screen.getByRole('button', { name: 'Nova conversa' }))
-  expect(confirm).toHaveBeenCalledWith(expect.stringContaining('Consulte o suporte'))
+  const dialog = screen.getByRole('dialog')
+  expect(within(dialog).getByText(/Consulte o suporte/)).toBeTruthy()
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Cancelar' }))
   expect(fetchMock).toHaveBeenCalledTimes(2)
   expect(screen.getByRole('button', { name: 'Enviar' }).hasAttribute('disabled')).toBe(true)
+  fireEvent.click(screen.getByRole('button', { name: 'Nova conversa' }))
+  fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Nova conversa' }))
+  expect(await screen.findByText('Atendimento: Aguardando mensagem')).toBeTruthy()
+  expect(fetchMock).toHaveBeenCalledTimes(3)
+})
+
+test('edits a user name only after confirming in the app dialog', async () => {
+  const admin = { user_id: 'admin-1', email: 'admin@example.test', display_name: 'ADMIN', role: 'admin' as const, must_change_password: false }
+  const managed = { ...admin, user_id: 'user-1', email: 'user@example.test', display_name: 'Maria', role: 'user' as const, is_active: true, created_at: '2026-10-15T10:00:00Z', updated_at: '2026-10-15T10:00:00Z', login_locked: false, login_locks: [] }
+  const fetchMock = vi.fn((url: string, options?: RequestInit) => {
+    if (url.startsWith('/api/admin/users?')) return Promise.resolve(reply({ items: [managed], total: 1 }))
+    if (url === '/api/admin/users/user-1' && options?.method === 'PATCH') return Promise.resolve(reply({ ...managed, display_name: 'Maria Silva' }))
+    return Promise.reject(new Error(`Unexpected URL: ${url}`))
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  Object.defineProperties(HTMLDialogElement.prototype, {
+    showModal: { configurable: true, value: function (this: HTMLDialogElement) { this.setAttribute('open', '') } },
+    close: { configurable: true, value: function (this: HTMLDialogElement) { this.removeAttribute('open') } },
+  })
+  render(<UsersPanel admin={admin} />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Editar nome de user@example.test' }))
+  const dialog = screen.getByRole('dialog')
+  expect(within(dialog).getByRole('textbox', { name: 'Nome' })).toBeTruthy()
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Cancelar' }))
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+  fireEvent.click(screen.getByRole('button', { name: 'Editar nome de user@example.test' }))
+  fireEvent.change(within(screen.getByRole('dialog')).getByRole('textbox', { name: 'Nome' }), { target: { value: 'Maria Silva' } })
+  fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Editar nome' }))
+  expect(await screen.findByText('Nome atualizado.')).toBeTruthy()
+  expect(fetchMock).toHaveBeenCalledWith('/api/admin/users/user-1', expect.objectContaining({ method: 'PATCH', body: JSON.stringify({ display_name: 'Maria Silva' }) }))
 })
 
 test('admin console loads live metrics, tickets and sources and pages through tickets', async () => {

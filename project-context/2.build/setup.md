@@ -1,6 +1,16 @@
-# Setup: scaffold do frontend MVP
+# Setup: ambiente atual e historico do scaffold
 
-## Escopo
+## Estado atual (2026-10-22)
+
+- O scaffold descrito abaixo e um registro historico de 2026-10-09/13, nao o estado atual da aplicacao. Hoje ha chat React/TypeScript/Vite, console administrativo, API FastAPI, runtime CrewAI, PostgreSQL 16 e adapter de tickets mock/ServiceNow. A autenticacao usa cookie JWT HttpOnly/SameSite=Strict, senhas Argon2 e RBAC (`admin`/`user`). O console e as rotas administrativas exigem admin; o chat exige usuario autenticado. O runtime configurado e `crewai`.
+- Pre-requisitos: Node.js >=20.19 ou >=22.12, Python 3.11-3.13, Docker Compose e PostgreSQL local. Na raiz, crie `.env` a partir de `.env.example`, configure `POSTGRES_PASSWORD`/`DATABASE_URL` coerentes e gere `JWT_SECRET` com `openssl rand -hex 32`. Nao versione nem compartilhe os segredos. Use `APP_ALLOWED_ORIGINS` para autorizar exatamente a origem do Vite; `COOKIE_SECURE=false` apenas para HTTP local. Consulte `README.md` para configuracao de proxy, provedores e ServiceNow.
+- Instalacao na raiz: `python3.11 -m venv .venv`, `.venv/bin/pip install -e 'src/backend[dev]'`, `docker compose up --wait db`; em `src/frontend/`, `npm ci`. Neste WSL, use `corepack npm` se `npm` do PATH apontar para Windows.
+- Antes de migrar bancos com conversas legadas, faca backup. Em `src/backend/`, execute `../../.venv/bin/dotenv -f ../../.env run -- ../../.venv/bin/alembic upgrade head` (revisao RBAC `20261022_02`). A migracao recusa conversas sem dono; `python -m app.cli purge-legacy` e `purge-legacy --confirm` so devem ser usados apos backup e autorizacao explicita. Crie o primeiro admin com `../../.venv/bin/dotenv -f ../../.env run -- ../../.venv/bin/python -m app.cli create-admin --email <email> --name "<nome>"`; a senha e solicitada no terminal.
+- Inicie a API em `127.0.0.1:8000` com `../../.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000` a partir de `src/backend/`. Em `src/frontend/`, `npm run dev` inicia o frontend (padrao `127.0.0.1:5173` ou `localhost:5173`); confirme que essa origem consta em `APP_ALLOWED_ORIGINS`. O proxy Vite encaminha `/api` para a API local.
+- Verificacoes atuais, na raiz: `.venv/bin/python -m pytest -q src/backend/tests` (102 passaram, 5 skipped por padrao), `.venv/bin/ruff check src/backend/app src/backend/tests`; em `src/frontend/`, `npm test` (37 passaram) e `npm run build` (aprovado). O teste HTTP/PostgreSQL opt-in em `src/backend/tests/test_api.py` passou com `RUN_LIVE_AUTH_E2E=1 ../../.venv/bin/python -m pytest -q tests/test_api.py -k test_live_auth_and_rbac` executado em `src/backend/`, com API e banco ativos; usa contas sinteticas e remove seus registros. Login e restricao de `/admin` tambem foram verificados no navegador com contas temporarias, removidas apos o teste. A senha do admin permanente nao foi usada nesse teste.
+- O status de qualidade de Build/Deliver nao e inferido destes testes: consulte `project-context/2.build/backend.md`, `integration.md` e `qa.md` para contratos, lacunas e gates por persona.
+
+## Escopo do scaffold inicial (historico)
 
 - Scaffold minimo React/TypeScript/Vite para a primeira etapa do chat em pt-BR. A pagina inicial e apenas um marcador tecnico; nao implementa chat, estados, mocks nem regras de negocio.
 - O runtime `crewai` e a linguagem primaria Python da configuracao dizem respeito ao backend futuro. Nao foram adicionados backend, banco, ServiceNow, testes de aplicacao ou variaveis de ambiente sem uso neste scaffold.

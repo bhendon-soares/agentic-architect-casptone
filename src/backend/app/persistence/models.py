@@ -29,6 +29,57 @@ class Base(DeclarativeBase):
     pass
 
 
+class User(Base):
+    __tablename__ = "users"
+    __table_args__ = (CheckConstraint("role IN ('user', 'admin')"),)
+
+    user_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(String(255))
+    password_hash: Mapped[str] = mapped_column(String(255))
+    role: Mapped[str] = mapped_column(String(16), default="user")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=True)
+    password_changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(default=utc_now, onupdate=utc_now)
+    created_by: Mapped[str | None] = mapped_column(ForeignKey("users.user_id"))
+
+
+class LoginAttempt(Base):
+    __tablename__ = "login_attempts"
+    __table_args__ = (UniqueConstraint("ip", "email_normalized"),)
+
+    attempt_id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=new_id
+    )
+    ip: Mapped[str] = mapped_column(String(45))
+    email_normalized: Mapped[str] = mapped_column(String(255), index=True)
+    failed_count: Mapped[int] = mapped_column(default=0)
+    last_failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    unlocked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    unlocked_by: Mapped[str | None] = mapped_column(ForeignKey("users.user_id"))
+
+
+class AuthAudit(Base):
+    __tablename__ = "auth_audit"
+
+    event_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    action: Mapped[str] = mapped_column(String(32))
+    actor_id: Mapped[str | None] = mapped_column(ForeignKey("users.user_id"))
+    target_id: Mapped[str | None] = mapped_column(ForeignKey("users.user_id"))
+    ip: Mapped[str] = mapped_column(String(45))
+    occurred_at: Mapped[datetime] = mapped_column(default=utc_now)
+
+
+class RevokedSession(Base):
+    __tablename__ = "revoked_sessions"
+
+    jti: Mapped[str] = mapped_column(String(36), primary_key=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
     __table_args__ = (CheckConstraint("clarification_count BETWEEN 0 AND 1"),)
@@ -36,6 +87,7 @@ class ChatSession(Base):
     session_id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=new_id
     )
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.user_id"), index=True)
     status: Mapped[str] = mapped_column(String(24), default="active")
     clarification_count: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime] = mapped_column(default=utc_now)

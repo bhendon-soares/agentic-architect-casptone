@@ -178,7 +178,7 @@ def test_openai_stage_records_only_complete_provider_usage(
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
-        session = ChatSession()
+        session = ChatSession(user_id="test-user")
         db.add(session)
         db.flush()
         run = AgentRun(session_id=session.session_id)
@@ -458,7 +458,7 @@ def test_sequential_crew_stages_validate_local_source(
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
-        session = ChatSession()
+        session = ChatSession(user_id="test-user")
         db.add(session)
         db.flush()
         run = AgentRun(session_id=session.session_id)
@@ -539,7 +539,7 @@ def test_live_crew_stages_with_synthetic_request(message: str) -> None:
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
-        session = ChatSession()
+        session = ChatSession(user_id="test-user")
         db.add(session)
         db.flush()
         run = AgentRun(session_id=session.session_id)
@@ -664,7 +664,7 @@ def test_low_confidence_decision(
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
-        session = ChatSession()
+        session = ChatSession(user_id="test-user")
         db.add(session)
         db.flush()
         run = AgentRun(session_id=session.session_id)
@@ -726,7 +726,7 @@ def test_crew_stage_failure_records_no_exception_text(
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
-        session = ChatSession()
+        session = ChatSession(user_id="test-user")
         db.add(session)
         db.flush()
         run = AgentRun(session_id=session.session_id)
