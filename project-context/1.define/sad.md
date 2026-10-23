@@ -4,7 +4,7 @@
 
 Este SAD atualiza a arquitetura do MVP Slim para a fase Build do AAMAD. O escopo arquitetural fica restrito a uma fatia vertical de IT Help Desk interno em portugues brasileiro:
 
-`chat -> agents -> conhecimento local -> decisao -> resposta ou ticket -> console admin`
+`login -> chat -> agents -> conhecimento local -> decisao -> resposta ou ticket -> console admin`
 
 O documento respeita o MRD/PRD como fonte de verdade, o runtime `crewai`, processo sequencial, `allow_delegation=false` por padrao, backend Python/FastAPI, frontend React/TypeScript, PostgreSQL local via Docker e integracao ServiceNow Table API para criacao de incidentes.
 
@@ -27,7 +27,7 @@ O documento respeita o MRD/PRD como fonte de verdade, o runtime `crewai`, proces
 - Tratar o backend como autoridade final para schema, dados minimos, seguranca, persistencia e `final_action`.
 - Limitar acoes externas mutating a criacao de incidente ServiceNow via `POST /api/now/table/incident`.
 - Redigir ou mascarar secrets/PII antes de persistencia, logs, eventos de agentes e ticketing.
-- Tornar o console admin suficiente para demo e debugging, sem RBAC, autenticacao ou niveis de acesso no P0.
+- Exigir identidade local, isolamento de conversas e RBAC `user`/`admin` em toda a API, inclusive atras de proxy.
 
 ### Core vs Future Features
 
@@ -40,13 +40,13 @@ O documento respeita o MRD/PRD como fonte de verdade, o runtime `crewai`, proces
 - Busca local em `knowledge/` com sete arquivos markdown ficticios, aprovados somente para a demo; primeira fatia integrada usa `password_reset`.
 - Adapter ServiceNow real para criar incidente.
 - Adapter ServiceNow mock/local para desenvolvimento e testes automatizados.
-- Console admin aberto para conversas, tickets, fontes, decisoes, eventos e metricas simples.
+- Login, troca de senha, historico proprio e console admin protegido com gestao de usuarios, conversas de terceiros somente leitura, tickets, fontes, decisoes, eventos e metricas.
 - Testes unitarios das regras principais e teste de integracao `chat -> agents -> ticket`.
 
 **P1/Future**:
 
 - `handoff_required` como acao separada.
-- RBAC, OIDC/autenticacao, multi-tenant e perfis de usuario.
+- OIDC/SSO, MFA, refresh tokens, revogacao por `jti`, multi-tenant e permissoes granulares.
 - Slack/Teams, omnichannel e mobile completo.
 - Vector DB/pgvector obrigatorio, sincronizacao incremental de conhecimento e sincronizacao incremental ServiceNow.
 - OpenTelemetry/APM/SIEM completo, LLM-as-judge e evals sofisticados.
@@ -64,8 +64,10 @@ O documento respeita o MRD/PRD como fonte de verdade, o runtime `crewai`, proces
 | ADR-006 | Knowledge local em `knowledge/`, sem vector DB obrigatorio, com aprovacao restrita a demo | Sete fontes ficticias por categoria P0; primeiro fluxo usa `password_reset`, sem presumir resolucao para `unknown` | MRD Technical Feasibility; PRD FR-003 |
 | ADR-007 | Backend chama adapter ServiceNow real ou mock/local somente apos persistir `final_action=open_ticket` | Agente prepara payload redigido sem acesso a ferramenta mutating; testes independem de ServiceNow externo | PRD FR-006 |
 | ADR-008 | Backend persiste `final_action` como autoridade final | `ResponseAgent` propoe `candidate_action`, `QAPolicyAgent` veta, backend valida e grava; `initial_action` de FR-002 e a sugestao inicial, nao uma segunda decisao persistida | PRD FR-002; PRD Decision Rules |
-| ADR-009 | Console admin aberto no P0 | Decisao fechada de produto; RBAC/auth ficam fora do MVP | PRD NFR Security & Compliance |
+| ADR-009 | Autenticacao local e RBAC `user`/`admin` no P0; autorizacao no backend, sem dependencia de loopback | Protege dados e console tambem atras de proxy | PRD FR-010 a FR-015; RBAC-01 a RBAC-16 |
 | ADR-010 | Tabelas de telemetria P1 separadas de P0; "nao disponivel" normalizado para campos sem medicao confiavel | Aba IA nao altera P0; precos de referencia informados sao visiveis, mas custo por execucao exige tokens confiaveis e tarifa aplicavel ao deployment; nao usar zero ficticio | PRD FR-009 Criteria de Aceite; PRD Future Features |
+| ADR-011 | JWT HS256 em cookie `httpOnly`, validacao por requisicao, `Origin` em escrita e bloqueio por IP + email | Sessao de 8h sem refresh; revogacao por estado do usuario/senha no banco | PRD FR-011; RBAC-04 a RBAC-11 |
+| ADR-012 | Dono obrigatorio em `chat_sessions`; migracao precedida de purge explicito | Impede acesso por UUID e atribuicao arbitraria de dados legados sem dono | PRD FR-012/FR-014; RBAC-12/13/15 |
 
 ## 2. Multi-Agent System Specification
 
@@ -84,6 +86,7 @@ O MVP usa cinco papeis agenticos em CrewAI. As definicoes de agents/tasks devem 
 ### Task / Turn Orchestration
 
 1. Frontend envia mensagem para `POST /api/chat/sessions/{session_id}/messages`.
+  API valida cookie, usuario ativo, troca pendente, `Origin` e dono da sessao antes de persistir ou invocar CrewAI; role/identidade nunca entram no runtime.
 2. Backend valida tamanho e executa bloqueio deterministico antes de invocar a crew para pedidos de revelacao de segredos, credenciais ou dados pessoais de terceiros; nesses casos persiste evento redigido e `final_action=blocked`, sem chamar CrewAI ou ServiceNow. Pedido legitimo de redefinicao de senha nao e pedido de revelacao. Para os demais, cria `request_id`/`agent_run_id`, redige secrets/PII conhecidos e persiste a mensagem redigida.
 3. `IntakeTriageAgent` produz `internal_category`, `servicenow_category`, `impact`, `urgency`, `resulting_priority`, `confidence`, `risk_flags` e sugestao inicial equivalente a `initial_action` de FR-002, sem campo concorrente a `candidate_action`/`final_action`.
 4. Backend valida taxonomia, impacto/urgencia e prioridade derivada somente de categoria, impacto e urgencia.
@@ -166,12 +169,14 @@ Na Build atual, o adapter OAuth e o commit anterior ao POST foram cobertos com H
 - React/TypeScript.
 - UI em portugues brasileiro.
 - API client tipado para backend FastAPI.
-- Sem requisito P0 de SSR, mobile completo, autenticacao, RBAC ou biblioteca visual especifica.
+- Sem requisito P0 de SSR, mobile completo ou biblioteca visual especifica; autenticacao e RBAC sao P0.
 
 ### Application Structure
 
-- `ChatPage`: cria/continua conversa, envia mensagem, exibe resposta, pergunta, bloqueio, ticket e fonte usada.
-- `AdminConsolePage`: entrada aberta para demo com abas ou secoes simples.
+- `AuthGate`: consulta `GET /api/auth/me` na abertura, exibe login em 401 e troca obrigatoria quando indicada.
+- `ChatPage`: lista historico proprio paginado, retoma/cria conversa, envia mensagem e exibe resultado e fonte.
+- `AdminConsolePage`: rota `/admin` somente para admin; `user` e redirecionado ao chat com "Acesso restrito".
+- `UsersTab`: busca/filtros/paginacao, cria, edita, redefine senha, confirma desativacao/reativacao e desbloqueia IPs; sem exclusao ou autodesativacao.
 - `TicketsList`: lista tickets locais/ServiceNow e status.
 - `ConversationDetail`: mostra mensagens redigidas, eventos de agentes, fonte, decisao final e ticket associado.
 - `MetricsSummary`: total de conversas, tickets criados, respostas com fonte e pedidos bloqueados.
@@ -181,7 +186,9 @@ Na Build atual, o adapter OAuth e o commit anterior ao POST foram cobertos com H
 - Chat com historico, estado de carregamento e erro recuperavel.
 - Exibir titulo/caminho/trecho da fonte quando houver resposta baseada em fonte.
 - Exibir justificativa curta da decisao final sem chain-of-thought.
-- Console admin sem login no P0, adequado a demo local/controlada.
+- Login com email/senha, sem cadastro/recuperacao, e texto para procurar admin; erro generico de credenciais/rede e aviso especifico de bloqueio.
+- Troca obrigatoria com senha atual, nova e confirmacao; topbar com nome e "Sair". Conversas de terceiros mostram dono e nao oferecem envio.
+- `chatApi.ts` usa `credentials: 'same-origin'` sem ler/armazenar JWT; 401 leva ao login com aviso de sessao expirada, 403 `PASSWORD_CHANGE_REQUIRED` abre troca, outros 403 exibem "Acesso restrito". Protecao real esta no backend.
 
 ### P1: Aba IA - Consumo, Custo, Latência e Resultados (FR-009)
 
@@ -221,7 +228,9 @@ A aba IA reutiliza o console admin existente e suas abas sem criar produto separ
 
 Endpoints P0 recomendados:
 
+- `POST /api/auth/login`; `GET /api/auth/me`; `POST /api/auth/change-password`; `POST /api/auth/logout`
 - `POST /api/chat/sessions`
+- `GET /api/chat/sessions` (somente historico proprio, `limit`/`offset`, mais recente primeiro)
 - `POST /api/chat/sessions/{session_id}/messages`
 - `GET /api/chat/sessions/{session_id}`
 - `GET /api/tickets`
@@ -230,6 +239,14 @@ Endpoints P0 recomendados:
 - `GET /api/metrics/summary`
 - `GET /api/knowledge/sources`
 - `GET /health`
+- `GET /api/admin/conversations*`, `/api/admin/tickets/*` (somente leitura de conversas alheias)
+- `GET /api/admin/users`; `GET /api/admin/users/{user_id}`; `POST /api/admin/users`; `PATCH /api/admin/users/{user_id}`; `POST /api/admin/users/{user_id}/reset-password`; `POST /api/admin/login-locks/unlock`
+
+Login recebe `{email, password}` e retorna `{user: {user_id, email, display_name, role, must_change_password}}` com cookie. `GET /api/auth/me` retorna o usuario atual; change-password recebe `{current_password, new_password}` e renova cookie; logout limpa cookie. Listagem de usuarios e paginada por `limit`/`offset`, com filtros de role, status e busca por nome/email; retorna identificador, email, nome, role, status, troca pendente, timestamps e indicador de bloqueio, nunca hash. Detalhe inclui IP/data dos bloqueios ativos daquele email. Criacao recebe `{email, display_name, role, temporary_password}`; patch altera nome, role ou status; reset recebe `{temporary_password}`; unlock recebe `{email, ip}` e registra `unlocked_by`. Nenhuma rota DELETE e exposta.
+
+`/health` e login sao publicos (login ainda exige `Origin`); auth/me, logout e change-password sao as unicas rotas permitidas durante troca pendente. Todas as demais exigem autenticacao. Leitura/escrita de sessao pelo chat exigem dono inclusive para admin e retornam 404 `SESSION_NOT_FOUND` para sessao alheia. Tickets, admin, IA, metricas, fontes e agent-runs exigem `require_role("admin")`; conversas alheias so nas rotas admin de leitura. Inventariar todas as rotas no Build e negar acesso por padrao, inclusive fora de `/api/admin`.
+
+Todas as mutacoes (`POST`, `PUT`, `PATCH`, `DELETE`), inclusive login, exigem `Origin` exato em `APP_ALLOWED_ORIGINS`. Erros no envelope `{data, error, meta}`: 401 `AUTH_REQUIRED`, `INVALID_TOKEN`, `INVALID_CREDENTIALS`; 403 `FORBIDDEN_ROLE`, `PASSWORD_CHANGE_REQUIRED`, `CSRF_REJECTED`; 404 `SESSION_NOT_FOUND`; 409 `EMAIL_TAKEN`, `SELF_DEACTIVATION`, `SELF_ROLE_CHANGE`, `LAST_ADMIN`; 429 `LOGIN_LOCKED`.
 
 **P1: Endpoints de Observabilidade (FR-009)**:
 
@@ -257,13 +274,16 @@ Envelope HTTP recomendado:
 
 Persistencia minima em PostgreSQL local:
 
-- `chat_sessions`: sessao, status, timestamps, `clarification_count`.
+- `users`: `user_id` UUID PK, email unico em minusculas, nome obrigatorio, hash argon2id, role `user`/`admin`, `is_active` default true, `must_change_password` default true, `password_changed_at`, timestamps e `created_by` FK nullable apenas para seed.
+- `login_attempts`: par unico `(ip, email_normalized)`, `failed_count`, `last_failed_at`, `locked_at`, `unlocked_at`, `unlocked_by`; bloqueios de emails inexistentes ficam fora da UI.
+- `chat_sessions`: sessao, `user_id` FK `users` NOT NULL, status, timestamps e `clarification_count`; indice por dono/recencia.
 - `chat_messages`: mensagens redigidas do usuario/sistema e metadados basicos.
 - `agent_runs`: execucoes, status, duracao, modelo/config resumida, erro redigido.
 - `agent_events`: eventos por etapa, inputs/outputs estruturados redigidos e decisao.
 - `knowledge_sources`: arquivo local, titulo, path, categoria interna e status aprovado.
 - `tickets`: ticket local, `servicenow_sys_id`, `servicenow_number`, categorias, impacto, urgencia, `resulting_priority`, status e payload redigido.
 - `app_logs`: logs estruturados redigidos quando nao forem armazenados apenas em arquivos/STDOUT.
+- Auditoria sem segredos de login, falha/bloqueio, desbloqueio, gestao de usuarios e troca de senha: ator (quando conhecido), alvo, IP e timestamp.
 
 **P1: Tabelas de Observabilidade (FR-009)**:
 
@@ -272,7 +292,7 @@ Persistencia minima em PostgreSQL local:
 - `pricing_config_versions`: tabela versionada de precos com campos modelo, deployment_id, moeda, tipo_token (entrada, saida, cache), tarifa_por_milhao, data_inicio, data_fim, ativo (boolean), criado em. Uma entrada ativa por modelo/deployment/tipo_token/moeda/periodo.
 - `agent_run_results_summary`: resultado final agregado por `agent_run_id` (respond, open_ticket, blocked, ask_clarification, failed, running) com timestamp persistencia.
 
-Nao ha tabelas P0 para tenants, roles, permissoes, OIDC identities ou perfis de prioridade.
+Nao ha tabelas P0 para tenants, permissoes granulares, identidades OIDC ou perfis de prioridade; `users.role` e a fonte de autorizacao.
 
 **Contrato de Medicao**:
 - Campos de token/custo exibem valor medido somente quando fornecido pelo CrewAI/provider com confiabilidade.
@@ -293,13 +313,14 @@ Nao ha tabelas P0 para tenants, roles, permissoes, OIDC identities ou perfis de 
 - `running`: execucao em andamento.
 - Replays nao entram no denominador de percentuais.
 
-Nao ha tabelas P0 para tenants, roles, permissoes, OIDC identities ou perfis de prioridade.
+Dados de demo sem dono exigem limpeza explicita antes da migration de `chat_sessions.user_id NOT NULL`; a migration falha sobre sessoes legadas e nao apaga registros automaticamente.
 
 ### Runtime Integration Layer
 
 - `AgentRuntimeService` encapsula CrewAI e normaliza entradas/saidas.
 - Validadores Pydantic ou equivalentes verificam contratos antes/depois de cada task.
 - O backend calcula e persiste `final_action`; agentes nao gravam diretamente no banco.
+- Apenas mensagem e historico redigidos entram no CrewAI; `user_id`, email e role nao entram em prompts, classificacao, prioridade ou decisao.
 - Somente o backend chama o adapter ServiceNow apos confirmar `final_action=open_ticket` persistida e validar o payload redigido preparado pelo agente de ticketing.
 - Prompt/runtime trace na Build deve redigir secrets e pode registrar hashes/templates em vez de texto sensivel.
 
@@ -343,6 +364,7 @@ Regras:
 - Dados minimos para abrir ticket: descricao do problema, entendimento de `impact` e entendimento de `urgency`.
 - `category` usa apenas `inquiry`, `software`, `hardware`, `network` ou `database`.
 - Adapter mock/local deve implementar o mesmo contrato de request/response relevante para testes.
+- Nunca adicionar role, email nem identidade do solicitante ao payload ServiceNow.
 
 ### Configuration and `.env` Strategy
 
@@ -361,8 +383,9 @@ Variaveis esperadas para `.env.example` da Build:
 - `TICKET_ADAPTER_MODE=mock|servicenow`
 - `KNOWLEDGE_BASE_PATH`
 - `LOG_LEVEL`
+- `JWT_SECRET`, `ADMIN_SEED_EMAIL`, `ADMIN_SEED_PASSWORD`, `APP_ALLOWED_ORIGINS`, `TRUSTED_PROXY_IPS`, `COOKIE_SECURE`
 
-Valores reais nunca devem ser commitados.
+Valores reais nunca devem ser commitados; `JWT_SECRET` deve ter ao menos 32 bytes e ser exigido no startup. `COOKIE_SECURE=false` e permitido apenas em dev; producao exige HTTPS.
 
 ## 5. DevOps & Deployment Architecture
 
@@ -372,6 +395,8 @@ Valores reais nunca devem ser commitados.
 - Backend usa `DATABASE_URL` e migrations simples.
 - ServiceNow real pode ser desligado localmente via `TICKET_ADAPTER_MODE=mock`.
 - `KNOWLEDGE_BASE_PATH` aponta para `knowledge/`, com sete fontes ficticias aprovadas para a demo; o teste inicial usa `password_reset` e o dataset final de 8-12 casos fica para marco posterior do P0.
+- Rollout em bases legadas: backup recomendado (`pg_dump`), `python -m app.cli purge-legacy --confirm` exibindo contagens, `alembic upgrade` com checagem de sessoes sem dono e `python -m app.cli create-admin` idempotente. Nenhum seed ou purge no startup da API.
+- Purge respeita FKs: `agent_events`, `agent_run_attempts`, `agent_run_telemetry`, `agent_run_results_summary`, `chat_messages`, `tickets`, `agent_runs`, `chat_sessions`; preserva `pricing_config_versions` e `knowledge_sources` e nao altera incidentes externos.
 
 ### CI/CD
 
@@ -381,12 +406,14 @@ Pipeline minimo recomendado:
 - Rodar lint/typecheck quando configurado.
 - Rodar unit tests de regras principais.
 - Rodar integration test `chat -> agents -> ticket` com adapter mock/local.
+- Rodar testes de autenticacao, ownership, CSRF, revogacao, bloqueios, migration e regressao de decisao nos dois perfis.
 - Rodar build frontend/backend.
 
 ### Environments
 
 - `local`: Postgres Docker, ServiceNow mock por default, knowledge local, logs verbosos.
-- `demo`: single-tenant, ServiceNow real quando credenciais estiverem presentes, dados sinteticos/redigidos.
+- `demo`: single-tenant, acesso autenticado por proxy HTTPS, ServiceNow real quando credenciais estiverem presentes, dados sinteticos/redigidos.
+- Vite `:5173` deve estar em `APP_ALLOWED_ORIGINS` em dev; frontend e API compartilham origem em producao. `TRUSTED_PROXY_IPS` contem apenas sockets de proxies confiaveis; caso contrario ignorar `X-Forwarded-For`.
 - Ambientes `staging`/`production` ficam Future.
 
 ### Observability
@@ -415,8 +442,13 @@ sequenceDiagram
     participant KB as Local Markdown/FAQ/Runbook
     participant SN as ServiceNow or Mock Adapter
 
-    U->>FE: mensagem em pt-BR
-    FE->>API: POST message
+    U->>FE: login e mensagem em pt-BR
+    FE->>API: POST login (Origin)
+    API->>DB: validar senha, bloqueio IP + email e usuario ativo
+    API-->>FE: cookie session httpOnly
+    FE->>API: POST message (cookie + Origin)
+    API->>DB: validar usuario, troca pendente e dono da sessao
+    API->>API: excluir identidade e role dos inputs CrewAI
     API->>API: validar pedido de revelacao antes da crew
     alt pedido de revelacao proibido
       API->>DB: persistir blocked e evento redigido
@@ -474,7 +506,7 @@ sequenceDiagram
 - Separar API e worker CrewAI.
 - Adicionar fila para execucoes longas.
 - Melhorar retrieval/ranking local.
-- Introduzir autenticacao, RBAC e isolamento de tenant.
+- Avaliar isolamento multi-tenant e permissoes granulares apos validar RBAC local.
 - Avaliar vector DB apenas apos validar a fatia vertical.
 
 ### Token and Cost Controls
@@ -545,9 +577,12 @@ Os quatro precos de referencia abaixo foram informados pelo operador e sao exibi
 
 ### AuthN/AuthZ
 
-- Console admin P0 e aberto, sem RBAC, niveis de acesso ou autenticacao.
-- O MVP e single-tenant.
-- Qualquer autenticacao/OIDC entra em P1/Future.
+- O MVP single-tenant exige login local para todas as rotas exceto `/health` e login; nao ha anonimato nem autocadastro. Admin inicial via CLI idempotente (`create-admin`, senha 12+); usuarios e resets pelo admin com senha temporaria 12+ e troca obrigatoria sem prazo de expiracao. Sem envio de email; CLI `unlock-login --email <email> [--ip <ip>]` recupera o unico admin bloqueado.
+- Login normaliza email, checa bloqueio por `(IP efetivo, email)` antes de verificar senha, registra falhas inclusive email inexistente e bloqueia o par na quinta falha ate desbloqueio manual (429 inclusive com senha correta). Sucesso zera contador; credencial invalida ou usuario inativo responde 401 generico. IP efetivo vem do socket; `X-Forwarded-For` so e aceito se socket em `TRUSTED_PROXY_IPS`. Atualizacao de contador/bloqueio e transacional para evitar corridas.
+- JWT HS256 com `sub` UUID, `role`, `iat`, `exp` (8h) e `jti`; cookie `session` com `HttpOnly`, `Secure` (desligavel apenas em dev), `SameSite=Strict`, `Path=/`, `Max-Age=28800`. Sem refresh ou blacklist por `jti`; logout apaga cookie (`Max-Age=0`), mas token copiado ainda e valido ate `exp` salvo revogacao por estado do usuario.
+- Dependency `current_user`: verificar cookie, assinatura e `exp`, carregar usuario e rejeitar inativo, role divergente ou `iat < password_changed_at` com 401 `INVALID_TOKEN`. Troca/reset atualiza timestamp; troca de senha exige senha atual, nova diferente e com 12+ caracteres, limpa obrigacao e emite novo cookie. `require_role("admin")` compoe `current_user`; troca pendente precede verificacao de role exceto para auth/me, change-password e logout.
+- Admin le conversas de terceiros apenas por `/api/admin/conversations*`, sem escrever. No chat, filtrar sessao por `user_id` antes de ler ou gravar (404 se ausente/alheia). Gestao de usuarios nao oferece DELETE; impede autodesativacao, troca da propria role e desativacao/rebaixamento do ultimo admin ativo em transacao.
+- CSRF: exigir `Origin` exato em `APP_ALLOWED_ORIGINS` em todo metodo nao seguro, inclusive login; `SameSite=Strict` reforca protecao sem token separado. Servir frontend/API na mesma origem HTTPS em producao; autorizacao nunca depende de loopback. OIDC/SSO e MFA ficam futuros.
 
 ### Security Baselines
 
@@ -573,6 +608,9 @@ Os quatro precos de referencia abaixo foram informados pelo operador e sao exibi
 - Primeiro integration test `password_reset` com fonte em `knowledge/`, PostgreSQL local e `TICKET_ADAPTER_MODE=mock`; verificar exibicao de titulo/caminho/trecho da fonte ou numero de incidente mock. Expandir depois para os demais fluxos P0 usando `project-context/1.define/support-cases.json`.
 - No dataset, `expected_source` e o documento recuperado por classificacao/RAG para justificar a decisao; nao implica exibicao da fonte ao usuario. Para `test_mode=deterministic`, o fixture assume categoria correta, confianca acima do limiar de escalonamento, dados minimos presentes e nenhuma pergunta adicional exceto quando `expected_action=ask_clarification` (TC004). TC012 permanece excecao: bloqueio pre-crew, sem categoria ou fonte recuperada. Essas premissas valem somente para testes e nao alteram a politica de confianca em producao.
 - Teste condicionado com ServiceNow real apenas quando variaveis estiverem presentes.
+- Testar matriz sem cookie, `user` em rotas admin/IA/tickets e admin em leitura de conversa alheia; 404 para leitura/escrita de sessao alheia inclusive admin. Cobrir token adulterado/expirado, usuario inativo, role alterada e senha redefinida.
+- Testar quinta e sexta falha bloqueada (mesmo com senha correta), isolamento por IP/email, desbloqueio UI/CLI, proxy confiavel versus header falsificado, Origin ausente/hostil, startup sem segredo e console sob proxy.
+- Testar troca obrigatoria e novo cookie, ultimo admin/autodesativacao/propria role, ausencia de DELETE e secrets em logs/respostas, purge/migration sem perda de pricing/fontes e `support-cases.json` com mesmas decisoes para `user`/`admin`.
 
 ### Runtime-Specific Quality Checks
 
@@ -594,6 +632,12 @@ Os quatro precos de referencia abaixo foram informados pelo operador e sao exibi
 | FR-007 Basic Admin Console | Tickets, conversa, eventos, fontes, metricas | Covered |
 | FR-008 QA And Basic Observability | Unit tests, integration test, logs/eventos | Covered |
 | FR-009 Aba IA (P1) | Tabelas de telemetria, APIs, filtros, paineis, precos, latencia, tentativas | Covered (P1 increment) |
+| FR-010 / RBAC-01 a 03 | Usuarios locais, CLI seed e senhas temporarias | Covered (P0 design) |
+| FR-011 / RBAC-04 a 11 | Cookie JWT, CSRF, revogacao, bloqueio, troca e logout | Covered (P0 design) |
+| FR-012 / RBAC-12 a 13 | Dono da sessao, historico proprio e consulta admin | Covered (P0 design) |
+| FR-013 / RBAC-14 | Gestao sem DELETE, bloqueios e protecoes do ultimo admin | Covered (P0 design) |
+| FR-014 / RBAC-15 a 16 | Purge explicito, migration fail-closed e rotas protegidas | Covered (P0 design) |
+| FR-015 | Login, navegacao, erros e regressao de decisao por role | Covered (P0 design) |
 
 ### Evaluation Criteria
 
@@ -609,6 +653,7 @@ O MVP nao exige LLM-as-judge nem evals sofisticados. A fase Build deve validar o
 | EC-006 | Telemetry (P1) | Tabela de precos cadastrada com tarifa ativa; 20+ execucoes com tokens confiavel | Nao aplicavel se confirmacao Azure Foundry pendente | Data validation + pricing config check | PRD FR-009 |
 | EC-007 | Latency (P1) | Media e p95 de duracao de etapas; replays nao incrementam contadores | 100% dos registros com latencia medida | Query assertion | PRD FR-009 |
 | EC-008 | Privacy (P1) | Zero secrets/PII em telemetria; migracao de dados com "nao disponivel" | 0 ocorrencias de PII em agent_run_telemetry | Log/DB scan | PRD FR-009 |
+| EC-009 | Security (P0) | Matriz RBAC, ownership, CSRF, revogacao, bloqueio e migracao | 15 criterios de aceite RBAC atendidos | Testes API/CLI/migration e smoke via proxy | PRD FR-010 a FR-015; RBAC acceptance 1-15 |
 
 ## 10. MVP Launch & Feedback Strategy
 
@@ -619,6 +664,7 @@ O MVP nao exige LLM-as-judge nem evals sofisticados. A fase Build deve validar o
 - `knowledge/` aprovado somente para demo; primeiro teste integrado `password_reset` usa PostgreSQL e adapter mock antes de expandir para demais categorias P0.
 - Unit tests principais e integration test P0 passam.
 - Console admin mostra conversa, ticket, fonte, eventos e metricas basicas.
+- Seed admin e login testados; API recusa startup sem segredo valido. Backup/purge confirmados antes da migration em bases legadas; proxy HTTPS permite acesso admin autorizado sem `local_admin`.
 
 ### Success Metrics
 
@@ -629,17 +675,17 @@ O MVP nao exige LLM-as-judge nem evals sofisticados. A fase Build deve validar o
 
 ### SFS Impact
 
-O arquivo `project-context/1.define/sfs/multi-agent-support-flow.md` foi mantido e substituido por uma SFS menor porque o fluxo integrado `chat -> agents -> ticket` e P0, reduz ambiguidade para frontend/backend/integration e ajuda diretamente o teste de integracao. O conteudo antigo foi removido quando tratava espanhol, `handoff_required`, vector/hybrid search, dataset 20-30, OIDC/RBAC ou outros itens P1/Future como se fossem P0.
+O arquivo `project-context/1.define/sfs/multi-agent-support-flow.md` especifica o fluxo integrado `chat -> agents -> ticket`; deve ser revisto no Build para exigir auth/ownership antes da crew. Referencias historicas a OIDC/RBAC como Future nao representam mais o PRD: RBAC local e P0; OIDC permanece futuro.
 
 ## Implementation Guidance for AI Development Agents
 
-1. `@project.mgr`: criar scaffold React/TypeScript, FastAPI, PostgreSQL Docker, env example, config CrewAI e estrutura de testes.
-2. `@frontend.eng`: implementar chat e console admin basico em pt-BR.
-3. `@backend.eng`: implementar schemas, persistencia, endpoints, runtime service, redacao e adapters ServiceNow real/mock.
-4. `@integration.eng`: conectar frontend/backend/CrewAI/knowledge/ticketing no fluxo P0.
-5. `@qa.eng`: implementar unit tests e integration test `chat -> agents -> ticket`.
-6. `@security.eng`: revisar secrets, PII, logs, env vars e tool allowlist.
-7. `@devops.eng`: empacotar compose, runbook, user guide e CI minimo.
+1. `@project.mgr`: planejar migration de users/locks/ownership e backup/purge/seed.
+2. `@frontend.eng`: implementar login, troca, historico proprio, topbar e aba Usuarios em pt-BR.
+3. `@backend.eng`: implementar CLI de purge/seed/unlock, migrations fail-closed, auth/CSRF/RBAC/ownership e proteger rotas antes da crew; preservar redacao e adapters.
+4. `@integration.eng`: conectar cookie de mesma origem ao fluxo frontend/backend/CrewAI/ServiceNow, inclusive sob proxy.
+5. `@qa.eng`: validar matriz de rotas, migration e regressao `support-cases.json` por role alem de unit/integration.
+6. `@security.eng`: revisar secrets, CSRF, proxy, ownership, revogacao e tool allowlist antes de Deliver.
+7. `@devops.eng`: documentar backup/purge/migration/seed, HTTPS/proxy, ambiente, CI e desbloqueio.
 
 ## Architecture Validation Checklist
 
@@ -651,6 +697,7 @@ O arquivo `project-context/1.define/sfs/multi-agent-support-flow.md` foi mantido
 - [x] `priority` nao e obrigatorio no payload outbound.
 - [x] `handoff_required` movido para P1/Future.
 - [x] Decisao sobre SFS registrada.
+- [x] RBAC-01 a RBAC-16 alinhados ao PRD P0; decisao independente do perfil preservada.
 
 ## Sources
 
@@ -660,6 +707,7 @@ O arquivo `project-context/1.define/sfs/multi-agent-support-flow.md` foi mantido
 - `aamad.config.yml`
 - `project-context/1.define/mrd.md`
 - `project-context/1.define/prd.md`
+- `project-context/1.define/rbac-change-request.md` (RBAC-01 a RBAC-16 incorporados ao PRD em 2026-10-22)
 - `project-context/1.define/sad.md` anterior, revisado e substituido
 - `project-context/1.define/sfs/multi-agent-support-flow.md` anterior, revisado e substituido
 - `src/backend/app/runtime/crew.py` (uma `Crew.kickoff()` por etapa e tratamento de falhas)
@@ -672,7 +720,7 @@ O arquivo `project-context/1.define/sfs/multi-agent-support-flow.md` foi mantido
 - `AAMAD_TARGET_RUNTIME` nao foi fornecido no ambiente da execucao; o runtime resolvido foi `crewai` a partir de `aamad.config.yml`, MRD e PRD.
 - O operador definiu OAuth para ServiceNow; a PDI deve disponibilizar credenciais OAuth, configuradas por `.env` na Build. O SAD nao registra valores secretos.
 - O operador aprovou sete arquivos ficticios em `knowledge/` somente para demo e os 12 casos representativos em `project-context/1.define/support-cases.json` para a validacao P0.
-- Console admin aberto e aceitavel apenas para ambiente local/demo single-tenant.
+- Frontend e API compartilham origem HTTPS em implantacao; apenas o frontend web consome a API HTTP. Em dev, origem Vite deve estar permitida. Dados legados de demo podem ser apagados pelo operador apos backup.
 - A SFS permanece necessaria apenas como especificacao funcional curta do fluxo integrado P0; demais detalhes ficam no PRD/SAD para evitar duplicacao.
 
 **P1: Assumptions sobre Telemetria e Precos (FR-009)**:
@@ -690,6 +738,7 @@ O arquivo `project-context/1.define/sfs/multi-agent-support-flow.md` foi mantido
 
 ## Audit
 
+- 2026-10-22; persona `system-arch`; acao `update-sad-rbac-mvp`: alinhamento do SAD com PRD FR-010 a FR-015 e change request RBAC-01 a RBAC-16; runtime `crewai` conforme PRD/config. Fontes: PRD, change request, SAD e template; revisao documental e edicao via `apply_patch`. Prompt Trace omitido: artefato de planejamento, sem prompts de runtime de producao.
 - 2026-10-19: operador informou precos de referencia USD por 1 milhao de tokens (entrada 2,00; cache 0,20; escrita cache 2,50; saida 10,00) e exemplos sem cache de USD 0,009 / 0,040 / 9,00. Frontend e API exibem referencias independentemente de tarifas ativas; custo por execucao continua condicionado ao deployment, vigencia e consumo confiavel.
 - Data: 2026-10-19; decisao do operador: aba IA somente em USD. Pesquisa no runtime local: eventos CrewAI observam chamadas logicas e tasks, nao garantem cada envio/retry do SDK; medir duracao da etapa no backend com `time.perf_counter()` inclusive em falha. Fechadas as tres questoes de tentativas, latencia e conversao; SKU/tarifa Azure permanece pendente. Validacao: `git diff --check`.
 - Data/hora: 2026-10-19T20:36:43-03:00
