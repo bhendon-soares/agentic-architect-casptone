@@ -63,6 +63,8 @@ Antes da migracao RBAC, os endpoints admin aceitavam apenas IP de cliente loopba
 ## Open Questions
 
 - Streaming e reconciliacao automatica de incidentes nao fazem parte do P0. O fluxo apos esclarecimento sem dados minimos permanece sem aprovacao de produto/integracao.
+- Revisao de 2026-10-23 (`AAMAD_TARGET_RUNTIME=crewai`): campos estruturados do incidente sao fixados pela triagem validada, e divergencias do agente de ticket deixam apenas nomes de campos em evento redigido. Dados minimos ausentes antes do ticket forcam esclarecimento contextual; respostas com fonte seguem permitidas, mas ticket sem minimo apos a pergunta continua negado (422, aceite pendente). Testes controlados: 112 passaram, 19 ignorados na suite padrao; lint passou. Sem provider ou POST ServiceNow nesta revisao; falhas live do QA ainda requerem reteste autorizado.
+- Correcao posterior em 2026-10-23: pedido explicito de ticket prevalece sobre `respond` da crew quando os dados minimos estao presentes, inclusive apos uma pergunta ou uma resposta com fonte. Se faltam dados no primeiro turno, o backend pergunta antes de abrir; uma resposta ao esclarecimento que recusa o ticket nao herda o pedido anterior. `ask_clarification` devolve apenas uma pergunta, sem procedimentos desacompanhados de fontes. O veto de seguranca e a exigencia de dados minimos para ticket permanecem. Regressao controlada em `test_policy_adapter.py` cobre `app_access` e `applications_issues`; suite offline: 126 passaram, 20 ignorados; Ruff passou nos arquivos alterados. Reteste live com provider e PDI ainda nao realizado; nenhum POST remoto foi feito nesta correcao.
 
 ## Audit
 

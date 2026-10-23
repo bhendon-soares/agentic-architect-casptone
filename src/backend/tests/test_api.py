@@ -2014,3 +2014,296 @@ def test_live_auth_and_rbac() -> None:
             db.execute(delete(User).where(User.user_id.in_((admin_id, user_id))))
             db.commit()
         engine.dispose()
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_LIVE_CHAT_CASES") != "1", reason="requires live provider and PDI"
+)
+@pytest.mark.parametrize(
+    "category,request_text,clarification",
+    [
+        (
+            "app_access",
+            "Abra um ticket: meu acesso ao aplicativo de pedidos e negado desde "
+            "as 09:00, somente eu fui afetado e nao consigo trabalhar. "
+            "Conta ficticia de teste, sem dados pessoais.",
+            "O aplicativo e o de pedidos; o erro e acesso negado desde as "
+            "09:00, so eu fui afetado e estou impedido de trabalhar.",
+        ),
+        (
+            "applications_issues",
+            "Abra um ticket: o relatorio no aplicativo de pedidos falha ao carregar "
+            "desde as 09:00 mesmo apos atualizar a pagina. So eu fui afetado e "
+            "nao consigo concluir meu trabalho. Caso ficticio.",
+            "O aplicativo e o de pedidos; o relatorio falha ao carregar desde as "
+            "09:00, so eu fui afetado e nao consigo concluir meu trabalho.",
+        ),
+        (
+            "critical_incident",
+            "Abra um ticket urgente: o sistema de vendas esta indisponivel desde "
+            "as 08:00 para centenas de funcionarios, bloqueando toda a operacao. "
+            "Caso ficticio de incidente critico.",
+            "O sistema e o de vendas, indisponivel desde as 08:00 para centenas "
+            "de funcionarios; a operacao inteira esta parada.",
+        ),
+        (
+            "network_wifi",
+            "Abra um ticket: o Wi-Fi corporativo esta indisponivel desde as 08:00 "
+            "em todo o escritorio, afetando todos os funcionarios e impedindo o "
+            "trabalho. Caso ficticio.",
+            "E o Wi-Fi corporativo em todo o escritorio, indisponivel desde as "
+            "08:00; todos estao impedidos de trabalhar.",
+        ),
+        (
+            "password_reset",
+            "Abra um ticket: minha senha corporativa expirou desde as 09:00 e nao "
+            "tenho mais acesso ao metodo de verificacao; so eu fui afetado e nao "
+            "consigo entrar no sistema. Conta ficticia, sem credenciais.",
+            "Minha senha corporativa expirou as 09:00 e nao tenho metodo de "
+            "verificacao; somente minha conta esta afetada e nao consigo trabalhar.",
+        ),
+        (
+            "printer_label",
+            "Abra um ticket: a impressora principal de etiquetas PRN-01 parou por "
+            "atolamento desde as 09:00, afetando toda a expedicao; nao conseguimos "
+            "emitir etiquetas. Caso ficticio.",
+            "A PRN-01 esta atolada desde as 09:00, toda a expedicao foi afetada e "
+            "nao consegue emitir etiquetas.",
+        ),
+        (
+            "unknown",
+            "Abra um ticket: meu computador esta com problema desde as 09:00 e nao "
+            "consigo trabalhar. Nao sei qual servico esta envolvido. Caso ficticio.",
+            "O dispositivo e o notebook corporativo; desde as 09:00 ele nao inicia "
+            "o aplicativo de pedidos, somente eu fui afetado e nao consigo trabalhar.",
+        ),
+    ],
+)
+def test_live_first_turn_ticket_by_category(
+    category: str, request_text: str, clarification: str
+) -> None:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parents[3] / ".env")
+    engine = create_engine(os.environ["DATABASE_URL"])
+    user_id = str(uuid4())
+    email = f"qa-chat-{uuid4().hex}@example.test"
+    password = secrets.token_urlsafe(24)
+    with Session(engine) as db:
+        db.add(
+            User(
+                user_id=user_id,
+                email=email,
+                display_name="QA Chat",
+                role="user",
+                password_hash=hasher.hash(password),
+                must_change_password=False,
+                password_changed_at=utc_now(),
+            )
+        )
+        db.commit()
+    try:
+        with httpx.Client(
+            base_url=os.getenv("LIVE_CHAT_BASE_URL", "http://127.0.0.1:5173"),
+            timeout=180,
+            headers={"Origin": "http://127.0.0.1:5173"},
+        ) as http:
+            assert (
+                http.post(
+                    "/api/auth/login", json={"email": email, "password": password}
+                ).status_code
+                == 200
+            )
+            created = http.post("/api/chat/sessions", json={})
+            assert created.status_code == 201
+            session_id = created.json()["data"]["session_id"]
+            assert (
+                http.get(f"/api/chat/sessions/{session_id}").json()["data"]["messages"]
+                == []
+            )
+            outcomes = []
+            for message in (request_text, clarification):
+                result = http.post(
+                    f"/api/chat/sessions/{session_id}/messages",
+                    headers={"Idempotency-Key": str(uuid4())},
+                    json={"message_text": message},
+                )
+                body = result.json()
+                data = body.get("data") or {}
+                outcomes.append(
+                    {
+                        "status": result.status_code,
+                        "run_id": body["meta"]["agent_run_id"],
+                        "action": data.get("final_action"),
+                        "message": data.get("message_pt_br"),
+                        "category": (data.get("triage") or {}).get("internal_category"),
+                        "sources": [
+                            source["path"] for source in data.get("sources", [])
+                        ],
+                        "ticket": data.get("ticket"),
+                        "error": (body.get("error") or {}).get("code"),
+                    }
+                )
+                if data.get("final_action") != "ask_clarification":
+                    break
+            print({"case": category, "session_id": session_id, "outcomes": outcomes})
+            if category in ("app_access", "applications_issues"):
+                if outcomes[0]["action"] == "ask_clarification":
+                    assert outcomes[0]["sources"] == []
+                    assert outcomes[0]["message"] == (
+                        "Qual servico ou equipamento apresenta o problema, o que "
+                        "acontece e qual o impacto no seu trabalho?"
+                    )
+            assert outcomes[-1]["status"] == 200
+            assert outcomes[-1]["action"] == "open_ticket"
+    finally:
+        with Session(engine) as db:
+            db.get(User, user_id).is_active = False
+            db.commit()
+        engine.dispose()
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_LIVE_CHAT_CASES") != "1", reason="requires live provider and PDI"
+)
+@pytest.mark.parametrize(
+    "category,message,clarification",
+    [
+        (
+            "app_access",
+            "Recebo acesso negado ao abrir o aplicativo de pedidos desde as "
+            "09:00. O que devo fazer?",
+            "O aplicativo de pedidos mostra acesso negado desde as 09:00. So minha "
+            "conta e afetada e nao consigo trabalhar.",
+        ),
+        (
+            "applications_issues",
+            "Ao consultar o historico de pedidos recebo erro de falha ao carregar "
+            "dados. Como posso resolver?",
+            "O aplicativo de pedidos falha ao carregar o historico desde as 09:00. "
+            "So eu fui afetado e ainda consigo realizar outras tarefas.",
+        ),
+        (
+            "critical_incident",
+            "O sistema de vendas esta indisponivel para centenas de usuarios "
+            "desde as 08:00. Como proceder?",
+            "O sistema de vendas esta indisponivel desde as 08:00 para centenas "
+            "de pessoas; a operacao inteira esta parada.",
+        ),
+        (
+            "network_wifi",
+            "Meu notebook perdeu conexao com o Wi-Fi corporativo hoje cedo. "
+            "O que devo verificar?",
+            "Somente meu notebook perdeu a conexao Wi-Fi hoje as 09:00; outros "
+            "colegas seguem conectados.",
+        ),
+        (
+            "password_reset",
+            "Nao consigo redefinir minha senha corporativa porque ela expirou. "
+            "Qual o procedimento?",
+            "A senha da minha conta expirou hoje as 09:00. Tenho acesso ao meu "
+            "metodo de verificacao e so eu fui afetado.",
+        ),
+        (
+            "printer_label",
+            "A impressora de etiquetas PRN-01 nao imprime e parece estar sem "
+            "etiquetas. Como resolver?",
+            "A PRN-01 nao imprime desde as 09:00 e parece sem etiquetas; somente "
+            "este equipamento foi afetado.",
+        ),
+        (
+            "unknown",
+            "Meu computador esta com problema, mas nao sei qual servico esta "
+            "envolvido. Pode ajudar?",
+            "Meu notebook nao inicia o aplicativo de pedidos desde as 09:00; "
+            "so eu fui afetado.",
+        ),
+        (
+            "forced_clarification",
+            "Estou com um problema no trabalho, mas ainda nao sei dizer qual "
+            "servico ou equipamento. Pode me orientar? Caso ficticio.",
+            "E minha conta corporativa no aplicativo de pedidos: aparece acesso "
+            "negado desde as 09:00, somente eu fui afetado. Como verificar o acesso?",
+        ),
+    ],
+)
+def test_live_guidance_by_category(
+    category: str, message: str, clarification: str
+) -> None:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parents[3] / ".env")
+    engine = create_engine(os.environ["DATABASE_URL"])
+    user_id = str(uuid4())
+    email = f"qa-guidance-{uuid4().hex}@example.test"
+    password = secrets.token_urlsafe(24)
+    with Session(engine) as db:
+        db.add(
+            User(
+                user_id=user_id,
+                email=email,
+                display_name="QA Guidance",
+                role="user",
+                password_hash=hasher.hash(password),
+                must_change_password=False,
+                password_changed_at=utc_now(),
+            )
+        )
+        db.commit()
+    try:
+        with httpx.Client(
+            base_url=os.getenv("LIVE_CHAT_BASE_URL", "http://127.0.0.1:5173"),
+            timeout=180,
+            headers={"Origin": "http://127.0.0.1:5173"},
+        ) as http:
+            assert (
+                http.post(
+                    "/api/auth/login", json={"email": email, "password": password}
+                ).status_code
+                == 200
+            )
+            created = http.post("/api/chat/sessions", json={})
+            assert created.status_code == 201
+            session_id = created.json()["data"]["session_id"]
+            outcomes = []
+            for text in (message, clarification):
+                result = http.post(
+                    f"/api/chat/sessions/{session_id}/messages",
+                    headers={"Idempotency-Key": str(uuid4())},
+                    json={"message_text": text},
+                )
+                body = result.json()
+                data = body.get("data") or {}
+                outcomes.append(
+                    {
+                        "status": result.status_code,
+                        "run_id": body["meta"]["agent_run_id"],
+                        "action": data.get("final_action"),
+                        "message": data.get("message_pt_br"),
+                        "category": (data.get("triage") or {}).get("internal_category"),
+                        "sources": [
+                            source["path"] for source in data.get("sources", [])
+                        ],
+                        "ticket": data.get("ticket"),
+                        "error": (body.get("error") or {}).get("code"),
+                    }
+                )
+                if data.get("final_action") != "ask_clarification":
+                    break
+            print(
+                {"guidance": category, "session_id": session_id, "outcomes": outcomes}
+            )
+            if category == "forced_clarification":
+                assert outcomes[0]["action"] == "ask_clarification"
+                assert len(outcomes) == 2
+                assert outcomes[1]["status"] == 200
+                assert outcomes[1]["action"] == "respond"
+                assert outcomes[1]["sources"]
+                return
+            assert outcomes[-1]["status"] == 200
+            assert outcomes[-1]["action"] in ("respond", "open_ticket")
+    finally:
+        with Session(engine) as db:
+            db.get(User, user_id).is_active = False
+            db.commit()
+        engine.dispose()

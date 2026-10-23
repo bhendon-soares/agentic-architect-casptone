@@ -19,7 +19,13 @@ from sqlalchemy.orm import Session
 
 from app.knowledge.catalog import knowledge_base, sync_catalog
 from app.persistence.models import AgentEvent, AgentRunTelemetry, KnowledgeSource
-from app.runtime.policy import CATEGORIES, TriageResult, priority, redact
+from app.runtime.policy import (
+    CATEGORIES,
+    TriageResult,
+    priority,
+    redact,
+    requests_ticket,
+)
 
 CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
 AGENTS_CONFIG = CONFIG_DIR / "agents.yaml"
@@ -335,13 +341,14 @@ def run_workflow(
         f"Classifique o relato redigido: {message}. "
         f"Escolha internal_category entre {list(CATEGORIES)}. "
         "Indique impact, urgency, confidence, risk_flags e missing_required_fields. "
+        "Se houver esclarecimento, reavalie os dados minimos considerando o relato "
+        "inicial e a resposta juntos; liste apenas dados indispensaveis que ainda "
+        "nao podem ser estabelecidos com seguranca. Nao invente dados. "
         f"{IMPACT_URGENCY_SCALE}",
         TriageInput,
     )
     if triage_input.internal_category not in CATEGORIES:
         raise InvalidAgentOutput("Unknown category")
-    if clarification_count and triage_input.missing_required_fields:
-        raise InvalidAgentOutput("Minimum ticket data missing")
     triage_fields = {
         **triage_input.model_dump(),
         "risk_flags": [redact(flag) for flag in triage_input.risk_flags],
@@ -407,9 +414,19 @@ def run_workflow(
         "Vete e bloqueie somente pedidos inseguros; aprove encaminhamento seguro.",
         PolicyDecision,
     )
+    ticket_requested = requests_ticket(message)
     action = "blocked" if policy.veto_to_blocked else draft.candidate_action
-    if action != "blocked" and triage_input.confidence < 0.70:
-        action = "open_ticket" if clarification_count else "ask_clarification"
+    if action != "blocked":
+        if (
+            triage_input.missing_required_fields
+            and not clarification_count
+            and (ticket_requested or action != "respond" or not sources)
+        ):
+            action = "ask_clarification"
+        elif ticket_requested:
+            action = "open_ticket"
+        elif triage_input.confidence < 0.70:
+            action = "open_ticket" if clarification_count else "ask_clarification"
     if action not in ("respond", "ask_clarification", "open_ticket", "blocked"):
         raise InvalidAgentOutput("Unknown action")
     if not policy.approved and not policy.veto_to_blocked:
@@ -439,22 +456,48 @@ def run_workflow(
             "impact, urgency, category. Sem dados pessoais ou credenciais.",
             TicketPayloadDraft,
         )
-        if (
-            payload.impact != triage.impact
-            or payload.urgency != triage.urgency
-            or payload.category != triage.servicenow_category
-        ):
-            raise InvalidAgentOutput("Ticket fields mismatch")
+        mismatched_fields = [
+            field
+            for field, expected in (
+                ("impact", triage.impact),
+                ("urgency", triage.urgency),
+                ("category", triage.servicenow_category),
+            )
+            if getattr(payload, field) != expected
+        ]
+        if mismatched_fields:
+            db.add(
+                AgentEvent(
+                    agent_run_id=agent_run_id,
+                    task_id="ticketing",
+                    producer="backend",
+                    status="validated",
+                    payload_redacted={"corrected_fields": mismatched_fields},
+                )
+            )
+            db.commit()
+        payload = payload.model_copy(
+            update={
+                "impact": triage.impact,
+                "urgency": triage.urgency,
+                "category": triage.servicenow_category,
+            }
+        )
     return {
         "action": action,
         "message": (
             "Nao posso atender a este pedido. Procure o suporte pelos canais oficiais."
             if action == "blocked"
+            else "Vou encaminhar o problema ao suporte por incidente."
+            if action == "open_ticket" and draft.candidate_action != action
             else (
-                "Qual servico apresenta o problema e o que acontece ao tentar "
-                "acessa-lo?"
+                "Qual servico foi afetado, quantas pessoas foram impactadas e "
+                "o trabalho esta parado?"
+                if triage.internal_category == "critical_incident"
+                else "Qual servico ou equipamento apresenta o problema, o que "
+                "acontece e qual o impacto no seu trabalho?"
             )
-            if action == "ask_clarification" and draft.candidate_action != action
+            if action == "ask_clarification"
             else redact(draft.message_pt_br)
         ),
         "summary": (

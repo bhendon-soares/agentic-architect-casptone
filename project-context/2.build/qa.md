@@ -1,5 +1,78 @@
 # QA do MVP de suporte interno
 
+## Atualizacao de QA - 2026-10-23
+
+Esta secao substitui os estados e totais de 2026-10-18 abaixo; aqueles registros permanecem como historico. Os ensaios atuais usaram relatos e identidades sinteticos, em conversas novas por cenario, com provider real, PostgreSQL, proxy Vite e ServiceNow PDI. Chamadas ao provider e os quatro POSTs bem-sucedidos na PDI tem custo/efeito externo; nao foram usados segredos reais nos relatos. Os testes live novos sao opt-in (`RUN_LIVE_CHAT_CASES=1`) e nao devem ser executados rotineiramente: abrem incidentes reais na PDI.
+
+### Unit e integracao
+
+- Backend completo: **104 passaram, 5 ignorados** na suite padrao; frontend: **40 passaram**, typecheck e build passaram. O teste de revisao de schema em PostgreSQL e o teste E2E real de RBAC passaram separadamente. A bateria HTTP `test_api.py` apos a adicao dos cenarios opt-in teve **52 passaram, 16 ignorados** (14 casos live novos desativados e dois gates anteriores). Ruff lint passou e a faixa nova passou no format check; o format check do arquivo inteiro ainda aponta trechos anteriores aos cenarios novos. Os testes com doubles verificam contratos, nao a qualidade da decisao do LLM.
+- Fluxo RBAC real: autenticacao por cookie, primeiro login com troca obrigatoria de senha, acesso negado sem autenticacao/Origin correto, permissao admin versus usuario, revogacao de sessao e auditabilidade foram exercitados. Este resultado revoga a afirmacao historica abaixo de que autenticacao/RBAC ainda nao existem; a revisao de seguranca formal continua pendente.
+- API e Vite responderam, proxy `/api` alcancou o backend e banco PostgreSQL estava disponivel. O comando `aamad validate` nao pode ser executado nesta maquina (`aamad` ausente).
+- Smoke autenticado no navegador em `http://127.0.0.1:5173/`: login com usuario sintetico, pergunta natural sobre falta de etiquetas na PRN-01, orientacao baseada na fonte local "Impressora de etiquetas", estado Concluido e historico com pergunta/resposta recuperado apos recarregar a pagina. A conta sintetica foi desativada ao final; nao houve pedido nem POST de ticket nesse smoke.
+
+### Conversas reais por assunto
+
+Cada linha representa duas conversas novas: uma solicitacao explicita de ticket na primeira mensagem e uma pergunta natural de orientacao, com uma resposta a eventual pergunta de esclarecimento. As falhas abaixo sao resultados reais, nao expectativas aprovadas. Resposta `422` significa ausencia dos dados minimos depois da clarificacao; `502` indica rejeicao da saida do agente antes de enviar o ticket.
+
+| Assunto | Ticket solicitado de primeira | Pergunta natural |
+| :-- | :-- | :-- |
+| `app_access` | Ticket criado `INC0010011` apos repeticao do caso; a primeira tentativa teve `502 TICKET_FIELDS_MISMATCH` | Orientacao com fonte local |
+| `applications_issues` | `502 TICKET_FIELDS_MISMATCH`, sem POST | Orientacao com fonte local |
+| `critical_incident` | Ticket criado `INC0010012` | `422` sem pedido de clarificacao util |
+| `network_wifi` | `502 TICKET_FIELDS_MISMATCH`, sem POST | Orientacao com fonte local |
+| `password_reset` | `502 TICKET_FIELDS_MISMATCH`, sem POST | Orientacao com fonte local |
+| `printer_label` | Ticket criado `INC0010013` | Orientacao com fonte local |
+| `unknown` | Ticket criado `INC0010014` apos esclarecimento | `422` apos esclarecimento |
+
+Nos pedidos de ticket que chegaram a `open_ticket`, o adapter confirmou a criacao e retornou os numeros acima. Os cenarios que pararam em `502` ou `422` nao fizeram POST remoto. Cinco das sete perguntas naturais produziram orientacao com fonte apropriada; uma pediu esclarecimento e mesmo assim falhou. A categoria `unknown` no pedido de ticket precisou de contexto adicional antes de abrir incidente. A repeticao de `app_access` mudou de erro para sucesso, portanto o comportamento do provider nao e estavel o bastante para ser declarado aprovado apenas pelo segundo resultado.
+
+### Defeitos e gates
+
+- **Alto - ticket nao criado em tres categorias:** `applications_issues`, `network_wifi` e `password_reset` falham com `502 AGENT_OUTPUT_INVALID` / `TICKET_FIELDS_MISMATCH` mesmo com relato sintetico de impacto e urgencia; `app_access` tambem falhou na primeira tentativa. A validacao em `runtime/crew.py` rejeita campos do payload divergentes dos campos da triagem. Persistem codigo e run, mas nao os valores divergentes; investigar o contrato entre triagem e ticketing com rastreio seguro, sem incluir PII ou segredos.
+- **Medio - fluxo natural nao recupera:** `critical_incident` retornou `422` sem pergunta que permitisse corrigir a ausencia de dados; `unknown` retornou `422` mesmo apos o esclarecimento. Revisar decisao de clarificacao e dados minimos exigidos antes de considerar estas categorias prontas.
+- **Gate de release:** faltam `evals.md`/limiares EC-001 a EC-005 e avaliacao formal de seguranca. Nao extrapolar os cinco sucessos de orientacao e os quatro tickets criados para acuracia geral, nem transformar falhas externas em testes unitarios deterministas. A revisao de seguranca deve incluir RBAC implementado, validacao de Origin, CSRF/sessoes e limites de acesso.
+- **Futuro:** capturar com seguranca as diferencas estruturadas de triagem e ticket em ambiente de teste; adicionar regressao com saidas controladas para cada erro observado; retestar os sete assuntos com provider apos a correcao; confirmar incidentes por GET read-only na PDI quando necessario, sem novos POSTs; medir variacao de decisoes, custo e latencia. Falhas/incerteza reais da PDI e aceite do HTTP 422 seguem pendentes.
+
+### Revisao de backend dos defeitos - 2026-10-23
+
+As falhas live acima permanecem historicas e nao foram repetidas com provider/PDI nesta revisao. O backend agora usa impact, urgency e category validados pela triagem no payload, mesmo quando o agente de ticket sugere outros valores; o evento registra somente os nomes dos campos corrigidos, sem valores ou relato. Testes controlados cobrem as quatro categorias que apresentaram divergencia. Dados minimos ausentes no primeiro turno forcam uma pergunta contextualizada antes do ticket, mas nao impedem uma resposta fundamentada com fonte; a resposta com fonte tambem pode ser entregue apos a pergunta. A triagem recebe instrucao para reavaliar relato inicial e esclarecimento juntos. **13 testes focados passaram**, a suite backend padrao teve **112 passaram, 19 ignorados**, e Ruff lint passou nos arquivos alterados. Nao ha comprovacao de estabilidade do provider nem novo POST remoto; quando ainda faltam dados para abrir ticket apos a pergunta, o 422 permanece e seu aceite de produto/integracao segue pendente. Evals e gate de release ficam para etapa posterior.
+
+### Reteste dirigido dos defeitos - 2026-10-23
+
+Esta rodada e posterior a revisao de backend acima. Foram executados **10 testes controlados focados** (todos passaram), inclusive um novo teste de dois turnos na crew que forca `ask_clarification` sem fonte seguido de `respond` com `knowledge/password_reset.md`. A suite backend padrao passou com **113 testes, 20 ignorados**; Ruff lint e format check da faixa alterada passaram. Os testes opt-in abaixo usaram a versao atual da API em porta isolada, provider real e relatos ficticios; nao sao prova de estabilidade estatistica do modelo.
+
+| Cenario live em conversa nova | Primeiro turno -> esclarecimento, quando solicitado | Desfecho |
+| :-- | :-- | :-- |
+| Pedido de ticket `app_access` | `ask_clarification` -> `respond` com `knowledge/app_access.md` | **Falhou expectativa de ticket:** nenhum incidente; sem 502 |
+| Pedido de ticket `applications_issues` | `ask_clarification` -> `respond` com `knowledge/applications_issues.md` | **Falhou expectativa de ticket:** nenhum incidente; sem 502 |
+| Pedido de ticket `network_wifi` | `open_ticket` na primeira mensagem | Passou: incidente `INC0010015` criado |
+| Pedido de ticket `password_reset` | `open_ticket` na primeira mensagem | Passou: incidente `INC0010016` criado |
+| Pergunta natural `critical_incident` | `ask_clarification` -> `open_ticket` | Passou sem 422: incidente `INC0010017` criado |
+| Pergunta natural `unknown` | `ask_clarification` -> `respond` com `knowledge/app_access.md` | Passou sem 422; triagem mudou para `app_access` |
+| Pergunta natural deliberadamente vaga | `ask_clarification` (`unknown`) -> `respond` (`app_access`) | Passou com `knowledge/app_access.md`; sem ticket |
+
+**Defeito ainda aberto (alto):** pedidos explicitos de ticket para `app_access` e `applications_issues` produziram uma pergunta e, depois da resposta, somente orientacao. O teste live exige `open_ticket` e falhou nestes dois casos; nenhum POST foi feito para eles. A divergencia estrutural que causava `TICKET_FIELDS_MISMATCH` nao se reproduziu nos sete cenarios, mas os dois fluxos que terminaram em `respond` nao chegaram ao estagio de ticket e nao validam esse caminho para suas categorias. Os dois tickets criados com as categorias antes afetadas passaram pelo adapter e retornaram numero remoto.
+
+**Observacao de qualidade:** o primeiro turno `app_access` pediu esclarecimento e incluiu passos operacionais, mas a resposta nao trouxe fonte no retorno desse turno (`sources=[]`); conferir se instrucoes junto da pergunta devem exigir fonte e teste especifico. O novo teste controlado garante a transicao para resposta com fonte no backend; a conversa live vaga confirma a mesma sequencia com o provider, sem prometer que ela ocorrera em toda execucao. Nao houve HTTP 422 nem 502 nesses sete retestes.
+
+**Gates adiados por decisao do projeto:** `evals.md`, limiares EC-001 a EC-005, monitoramento de producao e avaliacao formal de seguranca/release continuam pendentes para a etapa de fechamento para deploy. Estes retestes nao substituem `*run-evals`, nao aprovam os dois defeitos residuais e nao autorizam recomendacao de deploy. Houve tres POSTs de incidentes sinteticos na PDI nesta rodada; nao foram feitos GETs remotos de reconfirmacao.
+
+### Reteste das correcoes residuais - 2026-10-23
+
+Esta rodada reavaliou apenas os dois pedidos de ticket que falharam no reteste anterior e a qualidade da pergunta sem fonte. **13 testes controlados focados passaram** (intencao explicita, persistencia do pedido apos esclarecimento e pergunta sem instrucoes do modelo); Ruff lint e format check da faixa alterada passaram. A API atual foi iniciada em porta isolada (8002) com provider real e ServiceNow PDI; os dois casos live opt-in passaram. Relatos e contas foram sinteticos; as contas de teste foram desativadas pelo fixture.
+
+| Cenario live | Decisao e evidencia | Resultado |
+| :-- | :-- | :-- |
+| Pedido de ticket `app_access` | `ask_clarification` sem fonte, com somente a pergunta "Qual servico ou equipamento apresenta o problema, o que acontece e qual o impacto no seu trabalho?" (run `a14af691-f9cd-4aa4-997f-12e1704d01da`); apos resposta, `open_ticket` (run `7db90288-1d6d-4662-89e5-728f36d0bc37`) | Passou: HTTP 200 nos dois turnos; incidente PDI `INC0010018` criado, sessao `d1134c7c-98bd-47a4-989f-7ce644dc6b2d` |
+| Pedido de ticket `applications_issues` | `open_ticket` no primeiro turno (run `eea36c80-aaa1-415c-bd1e-4515db638374`) | Passou: HTTP 200; incidente PDI `INC0010019` criado, sessao `75cec5b4-2bba-4bfc-b6fa-3df7519cb863` |
+
+**Estado dos dois defeitos nesta rodada:** nao se reproduziu a perda do pedido explicito de ticket; ambos chegaram ao adapter e retornaram numero remoto. A pergunta observada em `app_access` nao incluiu passos operacionais nem alegou fonte inexistente (`sources=[]`). O teste live passou a exigir exatamente essa pergunta quando houver esclarecimento nas duas categorias; `applications_issues` abriu direto, portanto nao exercitou sua pergunta com provider real nesta rodada. Os incidentes nao foram reconfirmados por GET remoto. Dois sucessos nao demonstram estabilidade estatistica do provider nem cobrem outras categorias. Evals, revisao formal de seguranca e gates de release permanecem adiados ate o fechamento para deploy.
+
+### Auditoria da rodada
+
+Data: 2026-10-23; persona `@qa.eng`; fluxo autorizado de QA `*test-unit`, `*test-integration`, `*qa`, `*verify-flow`, `*log-defects` e `*future-work`. Runtime `crewai`; prompt e resposta foram armazenados apenas pelos mecanismos normais da aplicacao, sem copiar credenciais para este relatorio. Os testes opt-in em `src/backend/tests/test_api.py` registram resultado, run e sessao na saida da execucao e desativam os usuarios sinteticos no encerramento. A cobertura live passou a revelar defeitos nao capturados pelos doubles.
+
 ## Escopo e criterio
 
 Data: 2026-10-18. Runtime resolvido: `crewai` (`aamad.config.yml`; sem override registrado). Verificacoes do build atual: contrato da API, politica, adapter mock, interface React, dataset representativo e fluxo de chat. Testes com doubles nao constituem prova de execucao do provider ou de POST no ServiceNow PDI; o ensaio real adicional esta registrado abaixo. Aceite P0 permanece condicionado aos gaps abaixo, a avaliacao formal e a revisao de seguranca.

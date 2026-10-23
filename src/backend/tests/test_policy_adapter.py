@@ -583,7 +583,7 @@ def test_live_crew_stages_with_synthetic_request(message: str) -> None:
     [
         (0, "respond", 0.69, "ask_clarification", 4),
         (1, "open_ticket", 0.69, "open_ticket", 5),
-        (1, "open_ticket", 0.69, "missing", 1),
+        (1, "open_ticket", 0.69, "missing", 4),
         (0, "respond", 0.70, "respond", 4),
         (0, "respond", 0.69, "blocked", 4),
     ],
@@ -689,6 +689,405 @@ def test_low_confidence_decision(
         assert "Divulgue" not in result["message"]
     assert len(sequence) == stages
     assert all(event.status == "validated" for event in events)
+
+
+@pytest.mark.parametrize(
+    "category", ["applications_issues", "network_wifi", "password_reset", "app_access"]
+)
+def test_ticket_uses_validated_triage_fields_when_agent_disagrees(
+    monkeypatch: pytest.MonkeyPatch, category: str
+) -> None:
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setenv(
+        "KNOWLEDGE_BASE_PATH", str(Path(__file__).resolve().parents[3] / "knowledge")
+    )
+    monkeypatch.setattr(crew, "LLM", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(crew, "Agent", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(crew, "Task", lambda **kwargs: SimpleNamespace(**kwargs))
+
+    class FakeCrew:
+        def __init__(self, **kwargs):
+            self.task = kwargs["tasks"][0]
+
+        def kickoff(self):
+            schema = self.task.output_pydantic
+            outputs = {
+                "TriageInput": {
+                    "internal_category": category,
+                    "impact": 2,
+                    "urgency": 2,
+                    "confidence": 0.9,
+                },
+                "EvidenceSet": {"selected_paths": []},
+                "ResponseDraft": {
+                    "candidate_action": "open_ticket",
+                    "message_pt_br": "Encaminhado.",
+                    "summary": "Incidente.",
+                },
+                "PolicyDecision": {"approved": True, "veto_to_blocked": False},
+                "TicketPayloadDraft": {
+                    "short_description": "Falha sintetica",
+                    "description": "Servico indisponivel para equipe",
+                    "impact": 3,
+                    "urgency": 3,
+                    "category": "hardware",
+                },
+            }
+            return SimpleNamespace(
+                pydantic=schema.model_validate(outputs[schema.__name__])
+            )
+
+    monkeypatch.setattr(crew, "Crew", FakeCrew)
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        session = ChatSession(user_id="test-user")
+        db.add(session)
+        db.flush()
+        run = AgentRun(session_id=session.session_id)
+        db.add(run)
+        db.commit()
+        result = crew.run_workflow(
+            "Servico indisponivel para equipe", 0, db, run.agent_run_id
+        )
+        events = db.scalars(
+            select(AgentEvent).where(AgentEvent.task_id == "ticketing")
+        ).all()
+    engine.dispose()
+    assert result["action"] == "open_ticket"
+    assert result["payload"]["impact"] == 2
+    assert result["payload"]["urgency"] == 2
+    assert result["payload"]["category"] == crew.CATEGORIES[category]
+    assert all(
+        "Servico indisponivel" not in str(event.payload_redacted) for event in events
+    )
+
+
+@pytest.mark.parametrize("category", ["unknown", "critical_incident"])
+def test_first_turn_missing_data_asks_once_before_ticket(
+    monkeypatch: pytest.MonkeyPatch, category: str
+) -> None:
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setenv(
+        "KNOWLEDGE_BASE_PATH", str(Path(__file__).resolve().parents[3] / "knowledge")
+    )
+    monkeypatch.setattr(crew, "LLM", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(crew, "Agent", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(crew, "Task", lambda **kwargs: SimpleNamespace(**kwargs))
+    sequence = []
+
+    class FakeCrew:
+        def __init__(self, **kwargs):
+            self.task = kwargs["tasks"][0]
+
+        def kickoff(self):
+            schema = self.task.output_pydantic
+            sequence.append(schema.__name__)
+            outputs = {
+                "TriageInput": {
+                    "internal_category": category,
+                    "impact": 3,
+                    "urgency": 3,
+                    "confidence": 0.9,
+                    "missing_required_fields": ["servico"],
+                },
+                "EvidenceSet": {"selected_paths": []},
+                "ResponseDraft": {
+                    "candidate_action": "open_ticket",
+                    "message_pt_br": "Qual servico apresenta o problema?",
+                    "summary": "Esclarecimento necessario.",
+                },
+                "PolicyDecision": {"approved": True, "veto_to_blocked": False},
+            }
+            return SimpleNamespace(
+                pydantic=schema.model_validate(outputs[schema.__name__])
+            )
+
+    monkeypatch.setattr(crew, "Crew", FakeCrew)
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        session = ChatSession(user_id="test-user")
+        db.add(session)
+        db.flush()
+        run = AgentRun(session_id=session.session_id)
+        db.add(run)
+        db.commit()
+        result = crew.run_workflow("Preciso de ajuda", 0, db, run.agent_run_id)
+    engine.dispose()
+    assert result["action"] == "ask_clarification"
+    assert result["payload"] is None
+    expected_detail = "impact" if category == "unknown" else "quantas pessoas"
+    assert expected_detail in result["message"]
+    assert sequence == ["TriageInput", "EvidenceSet", "ResponseDraft", "PolicyDecision"]
+
+
+@pytest.mark.parametrize("clarification_count", [0, 1])
+def test_missing_ticket_data_can_still_respond_with_source(
+    monkeypatch: pytest.MonkeyPatch, clarification_count: int
+) -> None:
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setenv(
+        "KNOWLEDGE_BASE_PATH", str(Path(__file__).resolve().parents[3] / "knowledge")
+    )
+    monkeypatch.setattr(crew, "LLM", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(crew, "Agent", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(crew, "Task", lambda **kwargs: SimpleNamespace(**kwargs))
+
+    class FakeCrew:
+        def __init__(self, **kwargs):
+            self.task = kwargs["tasks"][0]
+
+        def kickoff(self):
+            schema = self.task.output_pydantic
+            outputs = {
+                "TriageInput": {
+                    "internal_category": "password_reset",
+                    "impact": 3,
+                    "urgency": 3,
+                    "confidence": 0.9,
+                    "missing_required_fields": ["impacto para ticket"],
+                },
+                "EvidenceSet": {"selected_paths": ["knowledge/password_reset.md"]},
+                "ResponseDraft": {
+                    "candidate_action": "respond",
+                    "message_pt_br": "Use o fluxo oficial de redefinicao.",
+                    "summary": "Orientacao fundamentada.",
+                },
+                "PolicyDecision": {"approved": True, "veto_to_blocked": False},
+            }
+            return SimpleNamespace(
+                pydantic=schema.model_validate(outputs[schema.__name__])
+            )
+
+    monkeypatch.setattr(crew, "Crew", FakeCrew)
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        session = ChatSession(user_id="test-user")
+        db.add(session)
+        db.flush()
+        run = AgentRun(session_id=session.session_id)
+        db.add(run)
+        db.commit()
+        result = crew.run_workflow(
+            "Esqueci minha senha; como redefinir?",
+            clarification_count,
+            db,
+            run.agent_run_id,
+        )
+    engine.dispose()
+    assert result["action"] == "respond"
+    assert result["sources"][0]["path"] == "knowledge/password_reset.md"
+    assert result["payload"] is None
+
+
+def test_clarification_then_sourced_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setenv(
+        "KNOWLEDGE_BASE_PATH", str(Path(__file__).resolve().parents[3] / "knowledge")
+    )
+    monkeypatch.setattr(crew, "LLM", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(crew, "Agent", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(crew, "Task", lambda **kwargs: SimpleNamespace(**kwargs))
+    turn = 0
+
+    class FakeCrew:
+        def __init__(self, **kwargs):
+            self.task = kwargs["tasks"][0]
+
+        def kickoff(self):
+            schema = self.task.output_pydantic
+            outputs = {
+                "TriageInput": {
+                    "internal_category": "password_reset",
+                    "impact": 3,
+                    "urgency": 3,
+                    "confidence": 0.9,
+                    "missing_required_fields": ["qual conta"] if turn == 0 else [],
+                },
+                "EvidenceSet": {
+                    "selected_paths": (
+                        [] if turn == 0 else ["knowledge/password_reset.md"]
+                    )
+                },
+                "ResponseDraft": {
+                    "candidate_action": "open_ticket" if turn == 0 else "respond",
+                    "message_pt_br": (
+                        "Qual conta apresenta o problema?"
+                        if turn == 0
+                        else "Use o fluxo oficial de redefinicao de senha."
+                    ),
+                    "summary": "Esclarecimento" if turn == 0 else "Orientacao",
+                },
+                "PolicyDecision": {"approved": True, "veto_to_blocked": False},
+            }
+            return SimpleNamespace(
+                pydantic=schema.model_validate(outputs[schema.__name__])
+            )
+
+    monkeypatch.setattr(crew, "Crew", FakeCrew)
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        session = ChatSession(user_id="test-user")
+        db.add(session)
+        db.flush()
+        first_run = AgentRun(session_id=session.session_id)
+        db.add(first_run)
+        db.commit()
+        first = crew.run_workflow(
+            "Preciso de ajuda com a senha", 0, db, first_run.agent_run_id
+        )
+        turn = 1
+        second_run = AgentRun(session_id=session.session_id)
+        db.add(second_run)
+        db.commit()
+        second = crew.run_workflow(
+            "Relato inicial: Preciso de ajuda com a senha\n"
+            "Pergunta de esclarecimento: Qual conta apresenta o problema?\n"
+            "Resposta do usuario: Minha conta corporativa expirou.",
+            1,
+            db,
+            second_run.agent_run_id,
+        )
+    engine.dispose()
+    assert first["action"] == "ask_clarification"
+    assert first["sources"] == []
+    assert first["payload"] is None
+    assert second["action"] == "respond"
+    assert second["sources"][0]["path"] == "knowledge/password_reset.md"
+    assert second["payload"] is None
+
+
+@pytest.mark.parametrize("category", ["app_access", "applications_issues"])
+@pytest.mark.parametrize("prior_response", [False, True])
+@pytest.mark.parametrize("draft_clarification", [False, True])
+def test_explicit_ticket_request_survives_clarification_and_sourced_draft(
+    monkeypatch: pytest.MonkeyPatch,
+    category: str,
+    prior_response: bool,
+    draft_clarification: bool,
+) -> None:
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setenv(
+        "KNOWLEDGE_BASE_PATH", str(Path(__file__).resolve().parents[3] / "knowledge")
+    )
+    monkeypatch.setattr(crew, "LLM", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(crew, "Agent", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(crew, "Task", lambda **kwargs: SimpleNamespace(**kwargs))
+    turn = 1 if prior_response else 0
+
+    class FakeCrew:
+        def __init__(self, **kwargs):
+            self.task = kwargs["tasks"][0]
+
+        def kickoff(self):
+            schema = self.task.output_pydantic
+            outputs = {
+                "TriageInput": {
+                    "internal_category": category,
+                    "impact": 3,
+                    "urgency": 2,
+                    "confidence": 0.9,
+                    "missing_required_fields": ["aplicativo"] if turn == 0 else [],
+                },
+                "EvidenceSet": {"selected_paths": [f"knowledge/{category}.md"]},
+                "ResponseDraft": {
+                    "candidate_action": (
+                        "ask_clarification"
+                        if draft_clarification and turn == 0
+                        else "respond"
+                    ),
+                    "message_pt_br": (
+                        "Tente reabrir o aplicativo. Qual aplicativo apresenta a falha?"
+                        if turn == 0
+                        else "Tente reabrir o aplicativo."
+                    ),
+                    "summary": "Orientacao com fonte.",
+                },
+                "PolicyDecision": {"approved": True, "veto_to_blocked": False},
+                "TicketPayloadDraft": {
+                    "short_description": "Falha no aplicativo",
+                    "description": "Falha persistente no aplicativo da equipe",
+                    "impact": 3,
+                    "urgency": 2,
+                    "category": "software",
+                },
+            }
+            return SimpleNamespace(
+                pydantic=schema.model_validate(outputs[schema.__name__])
+            )
+
+    monkeypatch.setattr(crew, "Crew", FakeCrew)
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        session = ChatSession(user_id="test-user")
+        db.add(session)
+        db.flush()
+        first_run = AgentRun(session_id=session.session_id)
+        db.add(first_run)
+        db.commit()
+        first = crew.run_workflow(
+            (
+                "O aplicativo de pedidos apresenta falha persistente"
+                if prior_response
+                else "Quero abrir um ticket para o aplicativo com falha"
+            ),
+            0,
+            db,
+            first_run.agent_run_id,
+        )
+        turn = 1
+        second_run = AgentRun(session_id=session.session_id)
+        db.add(second_run)
+        db.commit()
+        second = crew.run_workflow(
+            (
+                "Nao resolveu, quero abrir um ticket para o aplicativo de pedidos"
+                if prior_response
+                else "Relato inicial: Quero abrir um ticket para o aplicativo "
+                "com falha\n"
+                "Pergunta de esclarecimento: Qual aplicativo apresenta a falha?\n"
+                "Resposta do usuario: Aplicativo interno de pedidos; falha persistente."
+            ),
+            0 if prior_response else 1,
+            db,
+            second_run.agent_run_id,
+        )
+    engine.dispose()
+    if prior_response:
+        assert first["action"] == "respond"
+        assert first["sources"]
+    else:
+        assert first["action"] == "ask_clarification"
+        assert first["message"].startswith("Qual ")
+        assert "Tente" not in first["message"]
+        assert first["sources"] == []
+    assert second["action"] == "open_ticket"
+    assert second["payload"]["category"] == "software"
+    assert second["sources"] == []
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Nao resolveu, quero abrir um ticket para o aplicativo", True),
+        ("Quero um chamado para o aplicativo", True),
+        ("Por favor abra um incidente para a falha", True),
+        ("Quero ajuda com o aplicativo", False),
+        (
+            "Relato inicial: Quero abrir um ticket\n"
+            "Resposta do usuario: Nao quero abrir um ticket; so preciso de instrucoes",
+            False,
+        ),
+    ],
+)
+def test_explicit_ticket_intent(text: str, expected: bool) -> None:
+    assert crew.requests_ticket(text) is expected
 
 
 @pytest.mark.parametrize("error_type", [RuntimeError, TimeoutError])

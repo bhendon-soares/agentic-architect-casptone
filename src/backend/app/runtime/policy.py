@@ -82,3 +82,37 @@ def requests_third_party_secret(text: str) -> bool:
         and re.search(r"\b(colega|outra pessoa|terceiro|dele|dela)\b", normalized)
         and re.search(r"\b(envie|manda|mostre|revele|diga|forneca|passa)\b", normalized)
     )
+
+
+def requests_ticket(text: str) -> bool:
+    normalized = text.casefold()
+    latest = normalized.rsplit("resposta do usuario:", 1)[-1]
+    if re.search(
+        r"\b(?:nao|não)\s+(?:quero|preciso|gostaria|abra|abre|abrir)\b"
+        r"[^.!?\n]{0,30}\b(?:ticket|chamado|incidente)\b",
+        latest,
+    ):
+        return False
+    return bool(
+        re.search(
+            r"\b(?:quero|gostaria de|preciso de|pode|poderia|por favor)\b"
+            r"[^.!?\n]{0,100}\b(?:abrir|criar|registrar)\b"
+            r"[^.!?\n]{0,30}\b(?:ticket|chamado|incidente)\b",
+            normalized,
+        )
+        or re.search(
+            r"\b(?:quero|gostaria de|preciso de|pode|poderia|por favor)\b"
+            r"[^.!?\n]{0,30}\b(?:ticket|chamado|incidente)\b",
+            normalized,
+        )
+        or re.search(
+            r"\b(?:solicito|peço|peco)\b[^.!?\n]{0,30}"
+            r"\b(?:ticket|chamado|incidente)\b",
+            normalized,
+        )
+        or re.search(
+            r"\b(?:abra|abre)\b[^.!?\n]{0,30}"
+            r"\b(?:ticket|chamado|incidente)\b",
+            normalized,
+        )
+    )
