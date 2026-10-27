@@ -531,6 +531,9 @@ button:disabled {
 }
 
 .session-nav .nav-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   color: var(--text);
   font-weight: 700;
   padding: 10px 8px;
@@ -539,7 +542,7 @@ button:disabled {
 .session-nav .nav-toggle span {
   color: inherit;
   font-size: 13px;
-  margin: 0 0 0 8px;
+  margin: 0;
 }
 
 .session-nav.collapsed .nav-toggle span {

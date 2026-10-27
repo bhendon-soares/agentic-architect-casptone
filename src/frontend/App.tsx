@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
+import { PanelLeftClose, PanelLeftOpen } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import { createSession, getSession, listOwnSessions, sendMessage, type AuthUser, type ChatHistory, type RunError, type RunInput, type RunResult, type RunStatus } from './chatApi'
-import { formatDate, SiteHeader, StatusBadge } from './ui'
+import { SiteHeader, StatusBadge } from './ui'
 import './style.css'
 
 type Message = { id: number; role: 'user'; text: string } | { id: number; role: 'assistant'; result: RunResult } | { id: number; role: 'notice'; text: string }
@@ -87,6 +88,25 @@ export default function App({ user, onLogout, notice }: { user?: AuthUser; onLog
   }, [])
 
   useEffect(() => {
+    let cancelled = false
+    async function loadSessionTitles() {
+      for (const id of sessions.slice(1)) {
+        if (cancelled) break
+        if (sessionTitles[id]) continue
+        try {
+          const history = await getSession(id)
+          const firstMessage = history.messages.find((message) => message.role === 'user')
+          if (!cancelled) setSessionTitles((current) => current[id] ? current : { ...current, [id]: firstMessage?.message_pt_br?.trim().slice(0, 56) || 'Nova conversa' })
+        } catch {
+          if (!cancelled) setSessionTitles((current) => current[id] ? current : { ...current, [id]: 'Nova conversa' })
+        }
+      }
+    }
+    void loadSessionTitles()
+    return () => { cancelled = true }
+  }, [sessions])
+
+  useEffect(() => {
     if (conversationRef.current) conversationRef.current.scrollTop = conversationRef.current.scrollHeight
   }, [messages, status])
 
@@ -133,6 +153,7 @@ export default function App({ user, onLogout, notice }: { user?: AuthUser; onLog
         setSessionId(id)
         rememberSession(id)
       }
+      setSessionTitles((current) => ({ ...current, [id]: current[id] && current[id] !== 'Nova conversa' ? current[id] : input.message_text.trim().slice(0, 56) }))
       markForReview(id, true)
       const result = await sendMessage(id, input, key)
       markForReview(id, false)
@@ -178,6 +199,7 @@ export default function App({ user, onLogout, notice }: { user?: AuthUser; onLog
       activeSession.current = id
       setSessionId(id)
       rememberSession(id)
+      setSessionTitles((current) => ({ ...current, [id]: 'Nova conversa' }))
       setMessages([])
       setDraft('')
       setError(null)
@@ -203,7 +225,7 @@ export default function App({ user, onLogout, notice }: { user?: AuthUser; onLog
       setSessionId(id)
       setMessages(historyMessages(history))
       const firstMessage = history.messages.find((message) => message.role === 'user')
-      setSessionTitles((current) => ({ ...current, [id]: firstMessage?.message_pt_br?.trim().slice(0, 56) || `${formatDate(history.messages[0]?.created_at)} · ${id.slice(0, 8)}` }))
+      setSessionTitles((current) => ({ ...current, [id]: firstMessage?.message_pt_br?.trim().slice(0, 56) || 'Nova conversa' }))
       nextId.current = history.messages.length
       setDraft('')
       setError(null)
@@ -233,11 +255,11 @@ export default function App({ user, onLogout, notice }: { user?: AuthUser; onLog
       <main className="workspace">
         {toast && <p className="app-toast" role="alert">{toast}</p>}
         {sessions.length > 0 && <nav className={`session-nav ${navOpen ? '' : 'collapsed'}`} aria-label="Conversas anteriores">
-          <button type="button" className="nav-toggle" aria-expanded={navOpen} aria-label={navOpen ? 'Recolher conversas' : 'Mostrar conversas'} onClick={() => setNavOpen(!navOpen)}>{navOpen ? '‹' : '›'}<span>Conversas</span></button>
-          {navOpen && sessions.map((id) => <button type="button" key={id} title={sessionTitles[id] || id} aria-current={sessionId === id ? 'page' : undefined} disabled={status === 'running'} onClick={() => void selectSession(id)}>{sessionTitles[id] || id.slice(0, 8)}</button>)}
+          <button type="button" className="nav-toggle" aria-expanded={navOpen} aria-label={navOpen ? 'Recolher conversas' : 'Mostrar conversas'} title={navOpen ? 'Recolher conversas' : 'Mostrar conversas'} onClick={() => setNavOpen(!navOpen)}>{navOpen ? <PanelLeftClose size={18} aria-hidden="true" /> : <PanelLeftOpen size={18} aria-hidden="true" />}<span>Conversas</span></button>
+          {navOpen && sessions.map((id) => <button type="button" key={id} title={sessionTitles[id] || 'Nova conversa'} aria-current={sessionId === id ? 'page' : undefined} disabled={status === 'running'} onClick={() => void selectSession(id)}>{sessionTitles[id] || 'Nova conversa'}</button>)}
         </nav>}
         <div className="page-heading">
-          <div><p className="eyebrow">ATENDIMENTO / 01</p><h1>Como podemos ajudar?</h1></div>
+          <div><p className="eyebrow">SUPORTE DE TI</p><h1>Como posso ajudar?</h1></div>
           <div className="run-status" role="status" aria-live="polite">
             <StatusBadge tone={statusTone}>Atendimento: {statusLabel}</StatusBadge><small>Atualizado às {updatedAt.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</small>
           </div>

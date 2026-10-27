@@ -55,6 +55,9 @@ test('creates a session, posts the message and displays the sourced result', asy
   expect(screen.queryByText('Suporte TI · demonstração')).toBeNull()
   expect(screen.queryByText('knowledge/password_reset.md')).toBeNull()
   expect(screen.getByText(/Use o fluxo oficial de redefinição de senha/)).toBeTruthy()
+  expect(within(screen.getByRole('navigation', { name: 'Conversas anteriores' })).getByRole('button', { name: submitted.slice(0, 56) })).toBeTruthy()
+  expect(screen.getByRole('heading', { name: 'Como posso ajudar?' })).toBeTruthy()
+  expect(screen.getByText('SUPORTE DE TI')).toBeTruthy()
   expect(JSON.parse(localStorage.getItem('support-chat-sessions')!)).toEqual(['session-1'])
 })
 
@@ -116,11 +119,11 @@ test('restarts in a new session and restores the old conversation from the serve
   submitMessage()
   expect(await screen.findByText('Atendimento: Concluído')).toBeTruthy()
   fireEvent.click(screen.getByRole('button', { name: 'Nova conversa' }))
-  expect(await screen.findByRole('button', { name: 'session-' })).toBeTruthy()
+  expect(await within(screen.getByRole('navigation', { name: 'Conversas anteriores' })).findByRole('button', { name: 'Nova conversa' })).toBeTruthy()
   expect((screen.getByRole('textbox', { name: 'Descreva seu problema' }) as HTMLTextAreaElement).value).toBe('')
   expect(screen.getByRole('button', { name: 'Enviar' }).hasAttribute('disabled')).toBe(true)
   expect(screen.queryByText('Redefinição de senha')).toBeNull()
-  fireEvent.click(screen.getAllByRole('button', { name: 'session-' })[1])
+  fireEvent.click(within(screen.getByRole('navigation', { name: 'Conversas anteriores' })).getByRole('button', { name: 'Preciso de ajuda para acessar minha conta.' }))
   expect(await within(screen.getByRole('region', { name: 'Histórico da conversa' })).findByText('Mensagem anterior')).toBeTruthy()
   expect(fetchMock).toHaveBeenLastCalledWith('/api/chat/sessions/session-1', undefined)
   expect(JSON.parse(localStorage.getItem('support-chat-sessions')!)).toEqual(['session-2', 'session-1'])
@@ -141,6 +144,23 @@ test('loads a saved conversation after reopening the page', async () => {
   expect(fetchMock).toHaveBeenCalledWith('/api/chat/sessions/session-1', undefined)
 })
 
+test('shows the first message of other saved conversations without opening them', async () => {
+  localStorage.setItem('support-chat-sessions', JSON.stringify(['session-1', 'session-2']))
+  const fetchMock = vi.fn((url: string) => Promise.resolve(reply({
+    session_id: url.endsWith('session-1') ? 'session-1' : 'session-2', turns: [],
+    messages: [{ message_id: 'user-1', role: 'user', message_pt_br: url.endsWith('session-1') ? 'Problema atual' : 'Problema anterior', created_at: '2026-10-15T10:00:00Z' }],
+  })))
+  vi.stubGlobal('fetch', fetchMock)
+  render(<App />)
+  const list = screen.getByRole('navigation', { name: 'Conversas anteriores' })
+  expect(await within(list).findByRole('button', { name: 'Problema anterior' })).toBeTruthy()
+  expect(within(list).getByRole('button', { name: 'Problema atual' })).toBeTruthy()
+  expect(fetchMock).toHaveBeenCalledWith('/api/chat/sessions/session-2', undefined)
+  fireEvent.click(within(list).getByRole('button', { name: 'Recolher conversas' }))
+  expect(within(list).queryByRole('button', { name: 'Problema anterior' })).toBeNull()
+  expect(within(list).getByRole('button', { name: 'Mostrar conversas' })).toBeTruthy()
+})
+
 test('loads all owned conversations beyond the first page', async () => {
   const first = Array.from({ length: 100 }, (_, index) => ({ session_id: `session-${index}` }))
   const fetchMock = vi.fn().mockResolvedValueOnce(reply({ items: first, total: 101 }))
@@ -148,7 +168,7 @@ test('loads all owned conversations beyond the first page', async () => {
     .mockResolvedValueOnce(reply({ session_id: 'session-0', turns: [], messages: [] }))
   vi.stubGlobal('fetch', fetchMock)
   render(<App user={{ user_id: 'admin', email: 'admin@example.com', display_name: 'Admin', role: 'admin', must_change_password: false }} />)
-  expect(await screen.findByTitle('session-100')).toBeTruthy()
+  expect(await screen.findAllByTitle('Nova conversa')).toHaveLength(101)
   expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/chat/sessions?limit=100&offset=0', undefined)
   expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/chat/sessions?limit=100&offset=100', undefined)
   expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/chat/sessions/session-0', undefined)
