@@ -1,0 +1,2 @@
+{"id":"EDGE004","category":"explicit_ticket","input":"Abra um ticket: aplicativo de pedidos com acesso negado; só eu fui afetado e estou impedido de trabalhar.","expected_category":"app_access","expected_action":"open_ticket","expected_impact":3,"expected_urgency":1}
+{"id":"EDGE005","category":"explicit_ticket","input":"Abra um ticket: relatórios falham após atualizar; só eu fui afetado e não consigo concluir meu trabalho.","expected_category":"applications_issues","expected_action":"open_ticket","expected_impact":3,"expected_urgency":1}

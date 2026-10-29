@@ -1,0 +1,4 @@
+{"id":"TC001","category":"routine","input":"Não consigo redefinir minha senha corporativa porque ela expirou.","expected_category":"password_reset","expected_action":"respond","expected_source":"password_reset.md"}
+{"id":"TC005","category":"routine","input":"Ao consultar o histórico de pedidos recebo o erro 'Falha ao carregar dados'.","expected_category":"applications_issues","expected_action":"respond","expected_source":"applications_issues.md"}
+{"id":"TC007","category":"routine","input":"Meu notebook perdeu conexão com o Wi‑Fi corporativo hoje pela manhã.","expected_category":"network_wifi","expected_action":"respond","expected_source":"network_wifi.md"}
+{"id":"TC009","category":"routine","input":"A impressora de etiquetas PRN-01 não está imprimindo e aparentemente está sem etiquetas.","expected_category":"printer_label","expected_action":"respond","expected_source":"printer_label.md"}

@@ -1,0 +1,2 @@
+{"id":"TC004","category":"ambiguous","input":"Meu computador está com problema, mas não sei explicar qual serviço ou aplicação está envolvido.","expected_category":"unknown","expected_action":"ask_clarification","expected_source":"unknown.md"}
+{"id":"EDGE001","category":"ambiguous","input":"O sistema não funciona.","expected_category":"unknown","expected_action":"ask_clarification"}
