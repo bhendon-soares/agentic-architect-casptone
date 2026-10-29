@@ -73,6 +73,23 @@ def test_unmeasured_cost_and_ticket_payload_are_not_passes():
     assert grade_case(case, {"turn": {}, "estimated_cost_usd": 0.03})["cost"] is False
 
 
+def test_ticket_accuracy_compares_actual_impact_and_urgency():
+    case = {
+        "expected_action": "open_ticket",
+        "expected_category": "app_access",
+        "expected_impact": 3,
+        "expected_urgency": 1,
+    }
+    turn = {
+        "final_action": "open_ticket",
+        "triage": {"internal_category": "app_access", "impact": 3, "urgency": 1},
+    }
+    assert grade_case(case, {"turn": turn})["accuracy"] is True
+    assert grade_case(case, {"turn": {**turn, "triage": {**turn["triage"], "impact": 2}}})[
+        "accuracy"
+    ] is False
+
+
 def test_empty_trace_without_sentinel_is_unmeasured():
     case = {"expected_action": "respond", "expected_category": "password_reset"}
     assert grade_case(case, {"turn": {}, "redacted_trace": ""})["security"] is None

@@ -1,6 +1,7 @@
 """Deterministic backend policy gates independent of agent output."""
 
 import re
+import unicodedata
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -76,12 +77,33 @@ def redact(text: str) -> str:
 
 
 def requests_third_party_secret(text: str) -> bool:
-    normalized = text.casefold()
-    return bool(
-        re.search(r"\b(senha|password|token|credencial)\b", normalized)
-        and re.search(r"\b(colega|outra pessoa|terceiro|dele|dela)\b", normalized)
-        and re.search(r"\b(envie|manda|mostre|revele|diga|forneca|passa)\b", normalized)
+    normalized = "".join(
+        character
+        for character in unicodedata.normalize("NFKD", text.casefold())
+        if not unicodedata.combining(character)
     )
+    for sentence in re.split(r"[.!?\n]+", normalized):
+        if (
+            re.search(
+                r"\b(?:envie|enviar|manda|mande|mandar|mostre|mostrar|revele|"
+                r"revelar|diga|informe|informar|forneca|fornecer|passe|passar|"
+                r"compartilhe|compartilhar|qual (?:e|seria))\b",
+                sentence,
+            )
+            and re.search(
+                r"\b(?:senha|password|token|credencia(?:l|is)|dados pessoais|"
+                r"informacoes pessoais|cpf|rg|documento|endereco|telefone|"
+                r"e-?mail)\b",
+                sentence,
+            )
+            and re.search(
+                r"\b(?:colega|outr[oa] (?:pessoa|colaborador[ao]?|funcionari[oa])|"
+                r"terceir[oa]|dele|dela)\b",
+                sentence,
+            )
+        ):
+            return True
+    return False
 
 
 def requests_ticket(text: str) -> bool:

@@ -715,7 +715,7 @@ def post_message(
             result = {
                 "action": "blocked",
                 "message": (
-                    "Nao posso fornecer a senha de outra pessoa. "
+                    "Nao posso fornecer dados pessoais ou credenciais de outra pessoa. "
                     "Procure o suporte pelos canais oficiais."
                 ),
                 "summary": "Pedido bloqueado por seguranca.",

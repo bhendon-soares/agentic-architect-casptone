@@ -38,9 +38,9 @@ def grade_case(case: dict, observation: dict) -> dict[str, bool | None | str]:
         )
     if action == "open_ticket":
         accuracy = accuracy and all(
-            triage.get(field) == case[field]
-            for field in ("expected_impact", "expected_urgency")
-            if field in case
+            triage.get(field) == case[f"expected_{field}"]
+            for field in ("impact", "urgency")
+            if f"expected_{field}" in case
         )
     source = "n/a"
     if action == "respond" or sources:
