@@ -1,5 +1,11 @@
 # Integracao do chat P0
 
+## Revisao da integracao apos ajustes de seguranca (2026-10-29)
+
+- **Falha funcional corrigida, nova falha de seguranca (backend, redacao):** `redact` preserva agora `Preciso redefinir senha: esqueci meu acesso ao portal` e `Meu token e invalido e preciso abrir chamado`; testes HTTP verificam esses relatos e outros valores ficticios explicitos no workflow, banco e historico recarregado. Porem a excecao para `esqueci`/`invalido` preserva tambem `senha: esqueci SENHA_FICTICIA_123` e `Meu token e invalido TOKEN_FICTICIO_456; preciso abrir chamado`, incluindo os valores ficticios. `post_message` usa esse texto antes de persistir e chamar o workflow, portanto a excecao permite vazamento de credenciais nessa forma. Falha reproduzida por sonda sintetica, ainda nao coberta pelos testes. Corrigir a regra e adicionar teste HTTP com descricao de suporte seguida de segredo ficticio antes de liberar o deploy; a aceitacao anterior de redacao parcial nao comprova a seguranca desta nova excecao.
+- **Contrato de autenticacao e dependencias:** o frontend continua usando cookie de mesma origem e Origin nas mutacoes; o codigo de bloqueio temporario `LOGIN_LOCKED` ainda e tratado pela tela de login. O lockfile de desenvolvimento do frontend foi atualizado; nao houve mudanca de contrato HTTP nem migracao neste conjunto de alteracoes.
+- **Revalidacao local:** backend `155 passed, 20 skipped` (`.venv/bin/python -m pytest src/backend/tests -q --disable-warnings`), 23 testes focados aprovados e `ruff check` aprovado; frontend `43 passed` (`corepack npm test -- --run`) e `corepack npm run build` aprovado; `aamad validate --phase build` aprovado. A sonda de redacao acima encontrou vazamento apesar das suites verdes. Testes usam doubles/SQLite; nao foi feito round-trip em navegador contra API real, nem chamadas a provider ou ServiceNow. Risco residual anterior de redacao parcial e advisories ChromaDB estao documentados em `security.md` e nao foram reavaliados aqui.
+
 ## Estado atual: RBAC, logout e historico autenticado
 
 Esta secao substitui as afirmacoes historicas abaixo sobre "sem RBAC", protecao somente por loopback e ausencia de listagem de sessoes. As secoes datadas anteriores registram o estado da integracao antes da adicao de identidades locais; nao sao instrucoes para implantar a versao atual.

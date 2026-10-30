@@ -1,7 +1,7 @@
 """ASGI entry point for the support API."""
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from uuid import UUID, uuid4
 
@@ -51,6 +51,31 @@ from app.runtime.crew import (
 from app.runtime.policy import TriageResult, redact, requests_third_party_secret
 
 app = FastAPI(title="IT Help Desk MVP")
+LOGIN_LOCK_DURATION = timedelta(minutes=15)
+LOGIN_ATTEMPT_RESET = timedelta(hours=24)
+
+
+def login_lock_active(attempt: LoginAttempt, now: datetime) -> bool:
+    if attempt.locked_at is None or attempt.unlocked_at is not None:
+        return False
+    locked_at = attempt.locked_at.replace(tzinfo=timezone.utc)
+    repeat_count = max(0, (attempt.failed_count - 5) // 5)
+    return now < locked_at + LOGIN_LOCK_DURATION * (2 ** min(repeat_count, 4))
+
+
+def redact_data(value: object) -> object:
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, list):
+        return [redact_data(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: item
+            if key in {"session_id", "agent_run_id", "ticket_id"}
+            else redact_data(item)
+            for key, item in value.items()
+        }
+    return value
 
 
 @app.on_event("startup")
@@ -280,6 +305,7 @@ def health(request: Request) -> dict:
 def login(body: LoginInput, request: Request, db: Session = Depends(get_session)):
     email = normalized_email(body.email)
     ip = client_ip(request)
+    now = utc_now()
     if db.bind.dialect.name == "postgresql":
         db.execute(
             text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
@@ -290,8 +316,15 @@ def login(body: LoginInput, request: Request, db: Session = Depends(get_session)
         .where(LoginAttempt.ip == ip, LoginAttempt.email_normalized == email)
         .with_for_update()
     )
-    if attempt and attempt.locked_at and not attempt.unlocked_at:
+    if attempt and login_lock_active(attempt, now):
         return failure(request, "LOGIN_LOCKED", 429)
+    if attempt and attempt.last_failed_at and (
+        now - attempt.last_failed_at.replace(tzinfo=timezone.utc)
+        >= LOGIN_ATTEMPT_RESET
+    ):
+        attempt.failed_count = 0
+        attempt.locked_at = None
+        attempt.unlocked_at = None
     user = db.scalar(select(User).where(User.email == email))
     if (
         user is None
@@ -302,14 +335,14 @@ def login(body: LoginInput, request: Request, db: Session = Depends(get_session)
             attempt = LoginAttempt(ip=ip, email_normalized=email, failed_count=0)
             db.add(attempt)
         attempt.failed_count += 1
-        attempt.last_failed_at = utc_now()
-        if attempt.failed_count >= 5:
-            attempt.locked_at = utc_now()
+        attempt.last_failed_at = now
+        if attempt.failed_count >= 5 and attempt.failed_count % 5 == 0:
+            attempt.locked_at = now
             attempt.unlocked_at = None
         db.add(
             AuthAudit(
                 action="login_locked"
-                if attempt.locked_at and not attempt.unlocked_at
+                if login_lock_active(attempt, now)
                 else "login_failed",
                 target_id=user.user_id if user else None,
                 ip=ip,
@@ -394,6 +427,7 @@ def user_admin_data(user: User, db: Session) -> dict:
             LoginAttempt.unlocked_at.is_(None),
         )
     ).all()
+    locks = [lock for lock in locks if login_lock_active(lock, utc_now())]
     return {
         **user_data(user),
         "is_active": user.is_active,
@@ -746,8 +780,9 @@ def post_message(
                     )
                     if original is not None:
                         workflow_text = (
-                            f"Relato inicial: {original.message_pt_br}\n"
-                            f"Pergunta de esclarecimento: {question.message_pt_br}\n"
+                            f"Relato inicial: {redact(original.message_pt_br)}\n"
+                            "Pergunta de esclarecimento: "
+                            f"{redact(question.message_pt_br)}\n"
                             f"Resposta do usuario: {safe_text}"
                         )
             result = run_workflow(
@@ -1019,12 +1054,14 @@ def get_chat_session(
                     "message_id": message.message_id,
                     "agent_run_id": message.agent_run_id,
                     "role": message.role,
-                    "message_pt_br": message.message_pt_br,
+                    "message_pt_br": redact(message.message_pt_br),
                     "created_at": message.created_at,
                 }
                 for message in messages
             ],
-            "turns": [run.response_data for run in runs if run.response_data],
+            "turns": [
+                redact_data(run.response_data) for run in runs if run.response_data
+            ],
             "outcomes": [
                 {
                     "agent_run_id": run.agent_run_id,

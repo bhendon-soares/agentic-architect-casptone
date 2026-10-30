@@ -59,21 +59,41 @@ class TriageResult(BaseModel):
         return self
 
 
+_SUPPORT_DESCRIPTION = r"(?:esqueci|invalido|inválido)\b"
 _SECRET = re.compile(
     r"(?i)\b(?:password|senha|access[_ -]?token|token|api[_ -]?key|"
-    r"client[_ -]?secret|secret)\b\"?\s*[:=]\s*"
-    r"(?:\"[^\"\n]*\"|'[^'\n]*'|[^\s,;]+)"
+    r"client[_ -]?secret|secret)\b\"?\s*[:=]\s*+"
+    rf"(?!{_SUPPORT_DESCRIPTION})(?:\"[^\"\n]*\"|'[^'\n]*'|[^,\n;.!?]+)"
+)
+_NATURAL_SECRET = re.compile(
+    r"(?i)\b(?:minha?\s+)?(?:senha|password|token|api[_ -]?key|"
+    r"client[_ -]?secret)\b(?:\s+atual)?\s+(?:[ée]|is|vale|seria)\s++"
+    rf"(?!{_SUPPORT_DESCRIPTION})(?:\"[^\"\n]*\"|'[^'\n]*'|[^,\n;.!?]+)"
+)
+_RECOVERY_CODE = re.compile(
+    r"(?i)\b(?:c[oó]digo\s+(?:de\s+)?(?:recupera[cç][aã]o|backup)|"
+    r"(?:recovery|backup)[_ -]?code)\b\s*(?:[:=]|[ée]|is)\s*"
+    r"(?:\"[^\"\n]*\"|'[^'\n]*'|[^,\n;.!?]+)"
 )
 _BEARER = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]+={0,2}")
 _EMAIL = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
 _CPF = re.compile(r"\b\d{3}\.\d{3}\.\d{3}-\d{2}\b")
+_LABELED_CPF = re.compile(r"(?i)\bcpf\s*(?:[:=]|[ée])\s*\d{11}\b")
+_PHONE = re.compile(
+    r"(?<!\d)(?:\+?55[\s.-]?)?\(?[1-9]{2}\)?[\s.-]?"
+    r"(?:9\d{4}|[2-5]\d{3})[\s.-]?\d{4}(?!\d)"
+)
 
 
 def redact(text: str) -> str:
     text = _SECRET.sub("[REDACTED]", text)
+    text = _NATURAL_SECRET.sub("[REDACTED]", text)
+    text = _RECOVERY_CODE.sub("[REDACTED]", text)
     text = _BEARER.sub("[REDACTED]", text)
     text = _EMAIL.sub("[REDACTED]", text)
-    return _CPF.sub("[REDACTED]", text)
+    text = _CPF.sub("[REDACTED]", text)
+    text = _LABELED_CPF.sub("[REDACTED]", text)
+    return _PHONE.sub("[REDACTED]", text)
 
 
 def requests_third_party_secret(text: str) -> bool:

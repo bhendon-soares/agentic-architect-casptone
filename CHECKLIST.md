@@ -157,10 +157,12 @@ Preparacao existente: SAD section 9 define EC-001 a EC-005 e `support-cases.json
 
 ### Step 5.5: Security Assessment (`@security.eng`) — recommended before Deliver
 
-- [ ] Invoque `@security.eng` (obrigatorio neste projeto: `aamad.config.yml` define `security.require_security_assessment: true`).
-- [ ] Rode `*assess-security` (e `*scan-secrets` / `*review-deps` conforme necessario).
-- [ ] Complete project-context/2.build/security.md com findings ordenados por severity.
-- [ ] Encaminhe mitigations para as personas responsaveis; nao mude app logic dentro desta persona.
+- [x] Invoque `@security.eng` (obrigatorio neste projeto: `aamad.config.yml` define `security.require_security_assessment: true`).
+- [x] Rode `*assess-security` (e `*scan-secrets` / `*review-deps` conforme necessario).
+- [x] Complete project-context/2.build/security.md com findings ordenados por severity.
+- [x] Encaminhe mitigations para as personas responsaveis; nao mude app logic dentro desta persona.
+
+O assessment e os handoffs estao registrados em [security.md](project-context/2.build/security.md). Correcoes em andamento nao constituem aceite: o finding High exige revalidacao ou aceite formal do risco antes de Deliver.
 
 ---
 

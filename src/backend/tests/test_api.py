@@ -21,7 +21,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.adapters.tickets import TicketOutcomeUnknown, TicketRejected
 from app.auth import hasher, secret
-from app.main import app
+from app.main import app, redact_data
 from app.persistence.database import get_session
 from app.persistence.models import (
     AgentRun,
@@ -249,6 +249,39 @@ def test_rbac_login_lock_csrf_and_admin_safety(client: TestClient) -> None:
         ]["code"]
         == "SELF_ROLE_CHANGE"
     )
+
+
+def test_login_lock_expires_and_repeated_failures_extend_it(client: TestClient) -> None:
+    session_factory = app.dependency_overrides[get_session]
+    with next(session_factory()) as db:
+        for _ in range(5):
+            assert client.post(
+                "/api/auth/login",
+                json={"email": "admin@example.com", "password": "wrong"},
+            ).status_code == 401
+        attempt = db.scalar(select(LoginAttempt))
+        assert attempt is not None
+        attempt.locked_at = utc_now() - timedelta(minutes=16)
+        db.commit()
+    admin = client.get(f"/api/admin/users/{ADMIN_ID}").json()["data"]
+    assert admin["login_locked"] is False
+    for _ in range(5):
+        assert client.post(
+            "/api/auth/login",
+            json={"email": "admin@example.com", "password": "wrong"},
+        ).status_code == 401
+    assert client.post(
+        "/api/auth/login",
+        json={"email": "admin@example.com", "password": "test-admin-password"},
+    ).json()["error"]["code"] == "LOGIN_LOCKED"
+    with next(session_factory()) as db:
+        attempt = db.scalar(select(LoginAttempt))
+        attempt.locked_at = utc_now() - timedelta(minutes=31)
+        db.commit()
+    assert client.post(
+        "/api/auth/login",
+        json={"email": "admin@example.com", "password": "test-admin-password"},
+    ).status_code == 200
 
 
 def test_rbac_token_revocation_and_last_admin(client: TestClient) -> None:
@@ -627,6 +660,181 @@ def test_blocked_before_crew(
     assert ia["total_runs"] == 1
     assert ia["telemetry_rows"] == 0
     assert ia["estimated_cost_value"] is None
+
+
+def test_sensitive_chat_is_redacted_before_storage_and_workflow(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = []
+
+    def workflow(message, clarification_count, db, agent_run_id):
+        captured.append(message)
+        return {
+            "action": "blocked",
+            "message": "Procure o suporte.",
+            "summary": "Solicitacao recebida.",
+            "sources": [],
+            "triage": None,
+            "payload": None,
+        }
+
+    monkeypatch.setattr("app.main.run_workflow", workflow)
+    session_id = client.post("/api/chat/sessions", json={}).json()["data"]["session_id"]
+    response = client.post(
+        f"/api/chat/sessions/{session_id}/messages",
+        json={
+            "message_text": "Minha senha atual e EXEMPLO_FICTICIO_123 "
+            "palavras ocultas; "
+            "telefone 11987654321"
+        },
+    )
+    assert response.status_code == 200
+    assert "EXEMPLO_FICTICIO_123" not in captured[0]
+    assert "palavras ocultas" not in captured[0]
+    assert "11987654321" not in captured[0]
+    session_factory = app.dependency_overrides[get_session]
+    with next(session_factory()) as db:
+        message = db.scalar(
+            select(ChatMessage).where(ChatMessage.session_id == session_id)
+        )
+        assert "EXEMPLO_FICTICIO_123" not in message.message_pt_br
+        assert "palavras ocultas" not in message.message_pt_br
+        assert "11987654321" not in message.message_pt_br
+        message.message_pt_br = "Meu token é LEGACY_TOKEN_123"
+        db.commit()
+    owner = client.get(f"/api/chat/sessions/{session_id}").json()["data"]
+    admin = client.get(f"/api/admin/conversations/{session_id}").json()["data"]
+    assert "LEGACY_TOKEN_123" not in str(owner)
+    assert "LEGACY_TOKEN_123" not in str(admin)
+
+
+@pytest.mark.parametrize(
+    "message_text,description,secret",
+    [
+        (
+            "Preciso redefinir senha: esqueci meu acesso ao portal",
+            "Preciso redefinir senha: esqueci meu acesso ao portal",
+            None,
+        ),
+        (
+            "Meu token e invalido e preciso abrir chamado",
+            "Meu token e invalido e preciso abrir chamado",
+            None,
+        ),
+        (
+            "Preciso redefinir senha: SENHA_FICTICIA_123; esqueci meu acesso ao portal",
+            "esqueci meu acesso ao portal",
+            "SENHA_FICTICIA_123",
+        ),
+        (
+            "Meu token e TOKEN_FICTICIO_456; preciso abrir chamado",
+            "preciso abrir chamado",
+            "TOKEN_FICTICIO_456",
+        ),
+    ],
+)
+def test_chat_keeps_support_context_without_storing_credentials(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    message_text: str,
+    description: str,
+    secret: str | None,
+) -> None:
+    captured = []
+
+    def workflow(message, clarification_count, db, agent_run_id):
+        captured.append(message)
+        return {
+            "action": "blocked",
+            "message": "Procure o suporte.",
+            "summary": "Solicitacao recebida.",
+            "sources": [],
+            "triage": None,
+            "payload": None,
+        }
+
+    monkeypatch.setattr("app.main.run_workflow", workflow)
+    session_id = client.post("/api/chat/sessions", json={}).json()["data"]["session_id"]
+    response = client.post(
+        f"/api/chat/sessions/{session_id}/messages",
+        json={"message_text": message_text},
+    )
+    assert response.status_code == 200
+    assert description in captured[0]
+    session_factory = app.dependency_overrides[get_session]
+    with next(session_factory()) as db:
+        stored = db.scalar(
+            select(ChatMessage).where(ChatMessage.session_id == session_id)
+        ).message_pt_br
+    assert description in stored
+    history = client.get(f"/api/chat/sessions/{session_id}").json()["data"]
+    assert description in history["messages"][0]["message_pt_br"]
+    if secret:
+        assert secret not in captured[0]
+        assert secret not in stored
+        assert secret not in str(history)
+        assert secret not in str(response.json())
+
+
+def test_recovery_code_is_redacted_before_storage_and_workflow(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = []
+
+    def workflow(message, clarification_count, db, agent_run_id):
+        captured.append(message)
+        return {
+            "action": "blocked",
+            "message": "Procure o suporte.",
+            "summary": "Solicitacao recebida.",
+            "sources": [],
+            "triage": None,
+            "payload": None,
+        }
+
+    monkeypatch.setattr("app.main.run_workflow", workflow)
+    session_id = client.post("/api/chat/sessions", json={}).json()["data"]["session_id"]
+    response = client.post(
+        f"/api/chat/sessions/{session_id}/messages",
+        json={
+            "message_text": "Meu codigo de recuperacao e RECUPERACAO_FICTICIA_123; "
+            "nao consigo entrar"
+        },
+    )
+    assert response.status_code == 200
+    assert "RECUPERACAO_FICTICIA_123" not in captured[0]
+    assert "nao consigo entrar" in captured[0]
+    session_factory = app.dependency_overrides[get_session]
+    with next(session_factory()) as db:
+        message = db.scalar(
+            select(ChatMessage).where(ChatMessage.session_id == session_id)
+        )
+        assert "RECUPERACAO_FICTICIA_123" not in message.message_pt_br
+        message.message_pt_br = "Meu codigo de recuperacao e LEGACY_CODE_123"
+        db.commit()
+    assert "RECUPERACAO_FICTICIA_123" not in str(response.json())
+    owner = client.get(f"/api/chat/sessions/{session_id}")
+    admin = client.get(f"/api/admin/conversations/{session_id}")
+    assert owner.status_code == admin.status_code == 200
+    assert "LEGACY_CODE_123" not in str(owner.json()["data"])
+    assert "LEGACY_CODE_123" not in str(admin.json()["data"])
+
+
+def test_redact_data_preserves_generated_ids_but_redacts_message() -> None:
+    session_id = "c388199e-5677-4929-981a-3532699157b8"
+    agent_run_id = "37642f21-3824-4921-807c-6474b498981d"
+    result = redact_data(
+        {
+            "session_id": session_id,
+            "agent_run_id": agent_run_id,
+            "message": "Telefone 11987654321",
+        }
+    )
+    assert result == {
+        "session_id": session_id,
+        "agent_run_id": agent_run_id,
+        "message": "Telefone [REDACTED]",
+    }
 
 
 def test_low_confidence_after_question_creates_mock_ticket(
